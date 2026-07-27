@@ -1,0 +1,43 @@
+# Copy to "gluetun-auth.toml" and replace BOTH apikey values with your own.
+# Generate one with:  docker run --rm qmcgaw/gluetun:v3 genkey
+#
+# Never reuse a key from someone else's copy of this repo -- the whole point is
+# that it is unique to your machine.
+#
+# ---------------------------------------------------------------------------
+# HOW THIS FILE WORKS
+#
+# gluetun reads it once at startup from /gluetun/auth/config.toml (bind-mounted
+# read-only by docker-compose.yml). Each [[roles]] block is an allow-rule:
+#
+#   routes  = which "METHOD /path" combinations the role covers
+#   auth    = how a caller proves itself: "none", "basic", or "apikey"
+#   apikey  = the shared secret, sent by callers as an  X-API-Key:  header
+#
+# Providing this file REPLACES gluetun's built-in defaults entirely. Any route
+# not named in a role is denied outright -- including the ones that expose
+# OpenVPN settings and port-forwarding config. That default-deny is the point.
+#
+# Roles are additive: a route is reachable if ANY role lists it. Splitting them
+# up (below) is not required by gluetun -- it just documents intent and lets you
+# revoke one capability by deleting one block.
+#
+# Changes require a container recreate, not a restart:
+#   docker compose up -d --force-recreate gluetun
+#   docker compose up -d --force-recreate qbittorrent   # rejoin the new namespace
+# ---------------------------------------------------------------------------
+
+# Read-only status. Used by check-vpn.ps1 and by `vpn-toggle.ps1 status`.
+[[roles]]
+name = "healthcheck"
+routes = ["GET /v1/publicip/ip", "GET /v1/vpn/status"]
+auth = "apikey"
+apikey = "REPLACE_ME_RUN_GENKEY"
+
+# Pause/resume the tunnel. This is the one route that can disable your VPN --
+# delete this block if you do not want vpn-toggle.ps1 to work.
+[[roles]]
+name = "toggle"
+routes = ["PUT /v1/vpn/status"]
+auth = "apikey"
+apikey = "REPLACE_ME_RUN_GENKEY"

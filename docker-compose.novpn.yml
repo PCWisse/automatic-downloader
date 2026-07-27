@@ -1,0 +1,120 @@
+# ===========================================================================
+#  NO-VPN qBittorrent -- BENCHMARKING ONLY
+# ===========================================================================
+#
+#  ⚠  ANY torrent added here puts YOUR REAL IP INTO THE SWARM.
+#     Every peer sees it. So does anyone monitoring the swarm, which for
+#     public trackers includes copyright-enforcement firms who log IPs
+#     precisely this way. There is no kill switch here -- that is the point
+#     of the file, and the reason it is separate.
+#
+#  This is a SEPARATE instance. It does not touch the VPN-protected stack:
+#    - different project name      (downloader-novpn)
+#    - different container name    (qbittorrent-novpn)
+#    - different WebUI port        (8091, not 8090)
+#    - different config volume     (its own settings + torrent list)
+#    - different download folder   (D:\Torrents-novpn, not D:\Torrents)
+#
+#  The protected stack keeps running normally while this is up. Nothing you
+#  do here can leak into it, and nothing here inherits its torrents.
+#
+#  ---------------------------------------------------------------------
+#  START (explicit -f is required -- it can never start by accident):
+#      docker compose -f docker-compose.novpn.yml up -d
+#
+#  STOP (do this as soon as you are done measuring):
+#      docker compose -f docker-compose.novpn.yml down
+#
+#  WebUI: http://localhost:8091   (localhost only)
+#  ---------------------------------------------------------------------
+#
+#  For measuring RAW CONNECTION SPEED you do not need this at all --
+#  `.\speedtest.ps1` compares direct vs tunnelled throughput without putting
+#  a single packet into a torrent swarm. Use that first. Only use this file
+#  if you specifically need to observe qBittorrent's own behaviour (peer
+#  counts, stall behaviour, swarm connectivity) without the tunnel.
+#
+#  If you do test here, prefer a torrent nobody objects to you having --
+#  a Linux distro ISO from a well-seeded official tracker is the standard
+#  choice, and its large well-populated swarm is also the better benchmark.
+# ===========================================================================
+
+name: downloader-novpn
+
+services:
+  qbittorrent-novpn:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: qbittorrent-novpn
+    # No network_mode, no gluetun: this talks straight to the internet.
+    ports:
+      - 127.0.0.1:8091:8091      # WebUI, localhost only -- not even the LAN
+      # Torrenting port published on ALL interfaces (0.0.0.0), unlike the WebUI
+      # above. This is the one thing Privado can never offer: real incoming peer
+      # connections. Docker publishing this is necessary but NOT sufficient --
+      # your router also needs to forward 6882 (TCP+UDP) to this PC for it to
+      # actually work from the internet. Without that router step, this
+      # container is exactly as inbound-blocked as it was before, just for a
+      # different reason (ISP NAT instead of Privado's policy).
+      - 6882:6882/tcp
+      - 6882:6882/udp
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Amsterdam
+      - WEBUI_PORT=8091
+      - TORRENTING_PORT=6882     # distinct from the protected instance's 6881
+    volumes:
+      - qbittorrent-novpn-config:/config
+      - D:/Torrents-novpn:/data
+    # Deliberately NOT "unless-stopped": this must never survive a reboot or
+    # come back on its own. Every run should be a decision you just made.
+    restart: "no"
+
+  jellyfin:
+    image: lscr.io/linuxserver/jellyfin:latest
+    container_name: jellyfin
+    ports:
+      - 8096:8096
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Amsterdam
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
+    volumes:
+      - jellyfin-config:/config                # SQLite DB -- keep off drvfs
+      - jellyfin-cache:/cache
+      # Read-only: Jellyfin has no business writing to files qBittorrent may
+      # still be seeding. Only /complete is exposed, so partial downloads in
+      # /incomplete are never visible to the library.
+      - D:/Torrents/complete:/media:ro
+    # Hardware transcoding on the RTX 3070 Ti (verified: h264_nvenc encodes).
+    # Remove this block if you ever move the stack to a machine without NVIDIA.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+# ---------------------------------------------------------------------------
+# FIRST RUN ONLY: qBittorrent's factory-default save path is /downloads, which
+# does not exist in this container -- only /data is mounted above. A fresh
+# config volume WILL hit "Permission denied" file errors on every torrent
+# until the save path is corrected. Fixed once here, it persists in the volume:
+#
+#   docker compose -f docker-compose.novpn.yml stop qbittorrent-novpn
+#   docker run --rm -v downloader-novpn_qbittorrent-novpn-config:/config alpine sh -c "
+#     sed -i 's|=/downloads/incomplete/|=/data/incomplete/|g; s|=/downloads/|=/data/complete/|g' /config/qBittorrent/qBittorrent.conf"
+#   docker compose -f docker-compose.novpn.yml up -d
+#
+# Or just set it by hand in the WebUI: Options -> Downloads -> Save files to
+# /data/complete, incomplete to /data/incomplete -- either way, do this BEFORE
+# adding a torrent.
+# ---------------------------------------------------------------------------
+
+volumes:
+  qbittorrent-novpn-config:
+  jellyfin-config:
+  jellyfin-cache:

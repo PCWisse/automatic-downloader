@@ -1,0 +1,122 @@
+# Project name pinned explicitly. Without this, Compose derives the project name
+# from the FOLDER name -- so renaming the folder silently orphans every container
+# and every named volume: Compose would look for `newfolder_qbittorrent-config`,
+# not find it, and quietly create an empty one. Torrents, settings and password
+# gone. Pinning it means this folder can be renamed or moved freely from now on.
+name: downloader
+
+services:
+  # ---------------------------------------------------------------
+  # gluetun owns the network namespace. qBittorrent joins it, so if
+  # the tunnel drops qBittorrent loses ALL connectivity (kill switch).
+  # ---------------------------------------------------------------
+  gluetun:
+    image: qmcgaw/gluetun:v3
+    container_name: gluetun
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    ports:
+      # These belong here, NOT on qbittorrent: a container using
+      # network_mode: service:gluetun cannot publish its own ports.
+      #
+      # Deliberately off the default 8080/8000: both are heavily contested on a
+      # dev machine (8080 = Tomcat/webpack/countless others, 8000 = Django,
+      # uvicorn, python -m http.server). Keeping them free avoids future clashes.
+      #
+      # To change again: edit BOTH sides of the pair below AND the matching
+      # WEBUI_PORT / HTTP_CONTROL_SERVER_ADDRESS value, then
+      # `docker compose up -d && docker compose restart qbittorrent`.
+      # WebUI bound to 127.0.0.1 ONLY: reachable from this PC, invisible to the
+      # LAN and to the tailnet. If you later want to manage torrents from your
+      # phone, drop the "127.0.0.1:" prefix (and add HTTPS before you do).
+      - 127.0.0.1:8090:8090 # qBittorrent WebUI     -> keep in sync with WEBUI_PORT
+      # Control server bound to 127.0.0.1 ONLY: reachable from this PC, invisible
+      # to every other device on the LAN. Drop the "127.0.0.1:" prefix only if you
+      # genuinely need to query it from another machine.
+      - 127.0.0.1:8010:8010 # gluetun control server -> keep in sync with HTTP_CONTROL_SERVER_ADDRESS
+    volumes:
+      - gluetun-config:/gluetun
+      # API key auth for the control server. Without this file, some routes
+      # (GET /v1/vpn/status, GET /v1/publicip/ip) answer anyone with no
+      # credential at all -- verified before adding it.
+      - ./gluetun-auth.toml:/gluetun/auth/config.toml:ro
+    environment:
+      - VPN_SERVICE_PROVIDER=privado
+      - VPN_TYPE=openvpn                       # Privado in gluetun is OpenVPN only
+      - OPENVPN_USER=${PRIVADO_USER}
+      - OPENVPN_PASSWORD=${PRIVADO_PASSWORD}
+      - OPENVPN_PROTOCOL=udp                   # tcp if udp is blocked on your network
+      - SERVER_COUNTRIES=${PRIVADO_COUNTRIES:-Netherlands}
+      # Allow LAN + docker subnets so the WebUI stays reachable while
+      # everything else is forced through the tunnel.
+      - FIREWALL_OUTBOUND_SUBNETS=192.168.0.0/16,172.16.0.0/12,10.0.0.0/8
+      - TZ=Europe/Amsterdam
+      - UPDATER_PERIOD=24h                     # keep Privado server list fresh
+      - HTTP_CONTROL_SERVER_ADDRESS=:8010      # moved off the default :8000
+    restart: unless-stopped
+
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: qbittorrent
+    network_mode: service:gluetun              # <- all traffic via the VPN
+    depends_on:
+      gluetun:
+        condition: service_healthy             # don't start before the tunnel is up
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Amsterdam
+      - WEBUI_PORT=8090                        # passed as --webui-port, overrides the stored config
+      - TORRENTING_PORT=6881
+    volumes:
+      - qbittorrent-config:/config             # named volume = fast, not synced to OneDrive
+      # ONE mount, not two. D:/Torrents/incomplete and D:/Torrents/complete as
+      # separate mounts are cross-device (EXDEV), so finishing a torrent becomes
+      # a copy: Jellyfin sees a partial file appear and scans it mid-copy.
+      # Under a single mount the finish is an atomic rename -- Jellyfin only ever
+      # sees the file at full size.
+      - D:/Torrents:/data
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------
+  # Jellyfin deliberately does NOT use the VPN. It needs to be reachable
+  # from your LAN and to fetch artwork/metadata. Running it through gluetun
+  # would break both, and there is nothing to hide about serving your own
+  # files to yourself.
+  # ---------------------------------------------------------------
+  jellyfin:
+    image: lscr.io/linuxserver/jellyfin:latest
+    container_name: jellyfin
+    ports:
+      - 8096:8096
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Amsterdam
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
+    volumes:
+      - jellyfin-config:/config                # SQLite DB -- keep off drvfs
+      - jellyfin-cache:/cache
+      # Read-only: Jellyfin has no business writing to files qBittorrent may
+      # still be seeding. Only /complete is exposed, so partial downloads in
+      # /incomplete are never visible to the library.
+      - D:/Torrents/complete:/media:ro
+    # Hardware transcoding on the RTX 3070 Ti (verified: h264_nvenc encodes).
+    # Remove this block if you ever move the stack to a machine without NVIDIA.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+volumes:
+  gluetun-config:
+  qbittorrent-config:
+  jellyfin-config:
+  jellyfin-cache:

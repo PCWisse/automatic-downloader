@@ -1,0 +1,9 @@
+# Secrets -- never commit these.
+# The .example counterparts ARE committed, so a fresh clone knows what to fill in.
+.env
+gluetun-auth.toml
+
+# Windows / editor noise
+Thumbs.db
+desktop.ini
+*.swp
