@@ -1,15 +1,7 @@
-# Project name pinned explicitly. Without this, Compose derives the project name
-# from the FOLDER name -- so renaming the folder silently orphans every container
-# and every named volume: Compose would look for `newfolder_qbittorrent-config`,
-# not find it, and quietly create an empty one. Torrents, settings and password
-# gone. Pinning it means this folder can be renamed or moved freely from now on.
+# Full explanation of every line: docker-compose.annotated.yml
 name: downloader
 
 services:
-  # ---------------------------------------------------------------
-  # gluetun owns the network namespace. qBittorrent joins it, so if
-  # the tunnel drops qBittorrent loses ALL connectivity (kill switch).
-  # ---------------------------------------------------------------
   gluetun:
     image: qmcgaw/gluetun:v3
     container_name: gluetun
@@ -18,74 +10,147 @@ services:
     devices:
       - /dev/net/tun:/dev/net/tun
     ports:
-      # These belong here, NOT on qbittorrent: a container using
-      # network_mode: service:gluetun cannot publish its own ports.
-      #
-      # Deliberately off the default 8080/8000: both are heavily contested on a
-      # dev machine (8080 = Tomcat/webpack/countless others, 8000 = Django,
-      # uvicorn, python -m http.server). Keeping them free avoids future clashes.
-      #
-      # To change again: edit BOTH sides of the pair below AND the matching
-      # WEBUI_PORT / HTTP_CONTROL_SERVER_ADDRESS value, then
-      # `docker compose up -d && docker compose restart qbittorrent`.
-      # WebUI bound to 127.0.0.1 ONLY: reachable from this PC, invisible to the
-      # LAN and to the tailnet. If you later want to manage torrents from your
-      # phone, drop the "127.0.0.1:" prefix (and add HTTPS before you do).
-      - 127.0.0.1:8090:8090 # qBittorrent WebUI     -> keep in sync with WEBUI_PORT
-      # Control server bound to 127.0.0.1 ONLY: reachable from this PC, invisible
-      # to every other device on the LAN. Drop the "127.0.0.1:" prefix only if you
-      # genuinely need to query it from another machine.
-      - 127.0.0.1:8010:8010 # gluetun control server -> keep in sync with HTTP_CONTROL_SERVER_ADDRESS
+      # Ports for qbittorrent/prowlarr go HERE (shared namespace), not on those services.
+      - 127.0.0.1:8090:8090 # qBittorrent WebUI  -> must match WEBUI_PORT below
+      - 127.0.0.1:8010:8010 # gluetun control API -> must match HTTP_CONTROL_SERVER_ADDRESS below
+      - 127.0.0.1:9696:9696 # Prowlarr WebUI
+      - 127.0.0.1:8191:8191 # Byparr
     volumes:
       - gluetun-config:/gluetun
-      # API key auth for the control server. Without this file, some routes
-      # (GET /v1/vpn/status, GET /v1/publicip/ip) answer anyone with no
-      # credential at all -- verified before adding it.
       - ./gluetun-auth.toml:/gluetun/auth/config.toml:ro
     environment:
-      - VPN_SERVICE_PROVIDER=privado
-      - VPN_TYPE=openvpn                       # Privado in gluetun is OpenVPN only
-      - OPENVPN_USER=${PRIVADO_USER}
-      - OPENVPN_PASSWORD=${PRIVADO_PASSWORD}
-      - OPENVPN_PROTOCOL=udp                   # tcp if udp is blocked on your network
-      - SERVER_COUNTRIES=${PRIVADO_COUNTRIES:-Netherlands}
-      # Allow LAN + docker subnets so the WebUI stays reachable while
-      # everything else is forced through the tunnel.
+      # All VPN_* and OPENVPN_*/WIREGUARD_* values come from .env -- swapping
+      # providers, or moving from OpenVPN to WireGuard, never touches this file.
+      - VPN_SERVICE_PROVIDER=${VPN_SERVICE_PROVIDER:-privado}
+      - VPN_TYPE=${VPN_TYPE:-openvpn}
+      - OPENVPN_USER=${OPENVPN_USER:-}
+      - OPENVPN_PASSWORD=${OPENVPN_PASSWORD:-}
+      - OPENVPN_PROTOCOL=udp
+      # WireGuard providers (VPN_TYPE=wireguard in .env): these read as empty
+      # and are ignored by gluetun when unset, so it's safe to leave present.
+      - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY:-}
+      - WIREGUARD_ADDRESSES=${WIREGUARD_ADDRESSES:-}
+      - WIREGUARD_PUBLIC_KEY=${WIREGUARD_PUBLIC_KEY:-}
+      - WIREGUARD_ENDPOINT_IP=${WIREGUARD_ENDPOINT_IP:-}
+      - WIREGUARD_ENDPOINT_PORT=${WIREGUARD_ENDPOINT_PORT:-}
+      - SERVER_COUNTRIES=${VPN_COUNTRIES:-Netherlands}
       - FIREWALL_OUTBOUND_SUBNETS=192.168.0.0/16,172.16.0.0/12,10.0.0.0/8
-      - TZ=Europe/Amsterdam
-      - UPDATER_PERIOD=24h                     # keep Privado server list fresh
-      - HTTP_CONTROL_SERVER_ADDRESS=:8010      # moved off the default :8000
+      - TZ=${TZ:-Etc/UTC}
+      - UPDATER_PERIOD=24h
+      - HTTP_CONTROL_SERVER_ADDRESS=:8010
     restart: unless-stopped
 
   qbittorrent:
     image: lscr.io/linuxserver/qbittorrent:latest
     container_name: qbittorrent
-    network_mode: service:gluetun              # <- all traffic via the VPN
+    network_mode: service:gluetun
     depends_on:
       gluetun:
-        condition: service_healthy             # don't start before the tunnel is up
+        condition: service_healthy
     environment:
       - PUID=1000
       - PGID=1000
-      - TZ=Europe/Amsterdam
-      - WEBUI_PORT=8090                        # passed as --webui-port, overrides the stored config
+      - TZ=${TZ:-Etc/UTC}
+      - WEBUI_PORT=8090
       - TORRENTING_PORT=6881
     volumes:
-      - qbittorrent-config:/config             # named volume = fast, not synced to OneDrive
-      # ONE mount, not two. D:/Torrents/incomplete and D:/Torrents/complete as
-      # separate mounts are cross-device (EXDEV), so finishing a torrent becomes
-      # a copy: Jellyfin sees a partial file appear and scans it mid-copy.
-      # Under a single mount the finish is an atomic rename -- Jellyfin only ever
-      # sees the file at full size.
-      - D:/Torrents:/data
+      - qbittorrent-config:/config
+      - ${MEDIA_ROOT}:/data
     restart: unless-stopped
 
-  # ---------------------------------------------------------------
-  # Jellyfin deliberately does NOT use the VPN. It needs to be reachable
-  # from your LAN and to fetch artwork/metadata. Running it through gluetun
-  # would break both, and there is nothing to hide about serving your own
-  # files to yourself.
-  # ---------------------------------------------------------------
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr
+    network_mode: service:gluetun
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ:-Etc/UTC}
+    volumes:
+      - prowlarr-config:/config
+    restart: unless-stopped
+
+  byparr:
+    image: ghcr.io/thephaseless/byparr:latest
+    container_name: byparr
+    network_mode: service:gluetun
+    # dns:
+    #   - 1.1.1.1
+    #   - 8.8.8.8
+    # Optional but recommended for browser stability (esp. LXC / low-shm hosts)
+    shm_size: 2gb
+    environment:
+      - TZ=${TZ:-Etc/UTC}
+      # Optional: LOG_LEVEL=INFO
+      # Optional proxy (if you want Byparr's browser traffic to go through a proxy):
+      # - PROXY_SERVER=http://proxy.example.com:8080
+      # - PROXY_USERNAME=...
+      # - PROXY_PASSWORD=...
+    # Only expose the port if you need host access / debugging.
+    # # Inside the compose network Prowlarr can reach it as http://byparr:8191
+    # ports:
+    #   - 127.0.0.1:8191:8191
+    restart: unless-stopped  
+
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: sonarr
+    ports:
+      - 127.0.0.1:8989:8989
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ:-Etc/UTC}
+    volumes:
+      - sonarr-config:/config
+      - ${MEDIA_ROOT}:/data
+    restart: unless-stopped
+
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: radarr
+    ports:
+      - 127.0.0.1:7878:7878
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ:-Etc/UTC}
+    volumes:
+      - radarr-config:/config
+      - ${MEDIA_ROOT}:/data
+    restart: unless-stopped
+
+  bazarr:
+    image: lscr.io/linuxserver/bazarr:latest
+    container_name: bazarr
+    ports:
+      - 127.0.0.1:6767:6767
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ:-Etc/UTC}
+    volumes:
+      - bazarr-config:/config
+      - ${MEDIA_ROOT}:/data
+    restart: unless-stopped
+
+  sabnzbd:
+    image: lscr.io/linuxserver/sabnzbd:latest
+    container_name: sabnzbd
+    ports:
+      - 127.0.0.1:8080:8080
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ:-Etc/UTC}
+    volumes:
+      - sabnzbd-config:/config
+      - ${MEDIA_ROOT}:/data
+    restart: unless-stopped
+
   jellyfin:
     image: lscr.io/linuxserver/jellyfin:latest
     container_name: jellyfin
@@ -94,18 +159,14 @@ services:
     environment:
       - PUID=1000
       - PGID=1000
-      - TZ=Europe/Amsterdam
+      - TZ=${TZ:-Etc/UTC}
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
     volumes:
-      - jellyfin-config:/config                # SQLite DB -- keep off drvfs
+      - jellyfin-config:/config
       - jellyfin-cache:/cache
-      # Read-only: Jellyfin has no business writing to files qBittorrent may
-      # still be seeding. Only /complete is exposed, so partial downloads in
-      # /incomplete are never visible to the library.
-      - D:/Torrents/complete:/media:ro
-    # Hardware transcoding on the RTX 3070 Ti (verified: h264_nvenc encodes).
-    # Remove this block if you ever move the stack to a machine without NVIDIA.
+      - ${MEDIA_ROOT}/library:/media:ro
+    # No NVIDIA GPU? Delete this deploy: block or the container won't start.
     deploy:
       resources:
         reservations:
@@ -115,8 +176,121 @@ services:
               capabilities: [gpu]
     restart: unless-stopped
 
+
+  # First-time setup (web UI)
+  # Open: http://127.0.0.1:5055
+  
+  # Sign in with Jellyfin
+  # Jellyfin URL: http://jellyfin:8096
+  # (or http://127.0.0.1:8096 if the container name doesn’t resolve)
+  # Use an admin Jellyfin account
+  
+  # Connect Sonarr
+  # URL: http://sonarr:8989
+  # API key: from Sonarr → Settings → General
+  
+  # Connect Radarr
+  # URL: http://radarr:7878
+  # API key: from Radarr → Settings → General
+  
+  # Finish the wizard and create your Jellyseerr admin user.
+  
+  # 3. Optional but recommended tweaks
+
+  # jellyseerr:
+  #   image: fallenbagel/jellyseerr:latest
+  #   container_name: jellyseerr
+  #   environment:
+  #     - LOG_LEVEL=info
+  #     - TZ=${TZ:-Etc/UTC}
+  #     - PORT=5055
+  #   ports:
+  #     - 127.0.0.1:5055:5055        # only reachable from the host
+  #   volumes:
+  #     - jellyseerr-config:/app/config
+  #   restart: unless-stopped
+
+  recyclarr:
+    image: ghcr.io/recyclarr/recyclarr:8
+    container_name: recyclarr
+    user: 1000:1000
+    environment:
+      - TZ=${TZ:-Etc/UTC}
+      - CRON_SCHEDULE=0 3 * * *   # once daily at 03:00 -- not a live service, just a scheduled sync
+    volumes:
+      - ./recyclarr-config:/config
+    restart: unless-stopped
+
+  speed-monitor:
+    image: python:3.12-alpine
+    container_name: speed-monitor
+    working_dir: /app
+    volumes:
+      - ./speed-monitor:/app:ro
+      - ./speed-monitor/state:/state           # attempt history, must survive restarts
+    environment:
+      - QBIT_URL=http://gluetun:8090          # qBittorrent shares gluetun's namespace
+      - QBIT_USER=${QBITTORRENT_USER}
+      - QBIT_PASSWORD=${QBITTORRENT_PASSWORD}
+      - SONARR_URL=http://sonarr:8989
+      - SONARR_API_KEY=${SONARR_API_KEY}
+      - RADARR_URL=http://radarr:7878
+      - RADARR_API_KEY=${RADARR_API_KEY}
+      # 0.5 MiB/s -- lowered after 10 concurrent downloads proved to naturally
+      # split bandwidth thin per-torrent even when total throughput is fine
+      - SPEED_THRESHOLD_BPS=524288
+      - SUSTAINED_SECONDS=900                  # 15 min continuously below threshold -> act
+      - GRACE_PERIOD_SECONDS=600                # ignore downloads younger than 10 min
+      - POLL_INTERVAL_SECONDS=60
+      # A slow release is STOPPED, never deleted, and an alternative is tried.
+      # After this many stopped attempts for the same episode/movie, whichever
+      # got furthest is resumed as the final answer; the rest stay stopped.
+      - MAX_RETRIES=2
+      - PROGRESS_GUARD=0.20                    # never touch a download past 20% progress
+    command: sh -c "pip install --no-cache-dir requests --quiet && python monitor.py"
+    restart: unless-stopped
+
+  # One-shot configurator. Does NOT start with `docker compose up -d` (the
+  # profile keeps it out of the default set). Run it explicitly:
+  #
+  #     docker compose run --rm setup
+  #
+  # Safe to re-run: every step checks current state and skips or updates
+  # rather than duplicating. Nothing is ever deleted.
+  setup:
+    profiles: ["setup"]
+    image: python:3.12-alpine
+    working_dir: /app
+    volumes:
+      - ./setup:/app:ro
+      # Read-only access to each app's config, purely to read its generated API
+      # key. Mounting the Docker socket would be the alternative and is a far
+      # bigger privilege to hand a script -- deliberately avoided.
+      - sonarr-config:/keys/sonarr:ro
+      - radarr-config:/keys/radarr:ro
+      - prowlarr-config:/keys/prowlarr:ro
+      - bazarr-config:/keys/bazarr:ro
+      - sabnzbd-config:/keys/sabnzbd:ro
+    environment:
+      - QBITTORRENT_USER=${QBITTORRENT_USER:-}
+      - QBITTORRENT_PASSWORD=${QBITTORRENT_PASSWORD:-}
+      - JELLYFIN_ADMIN_USER=${JELLYFIN_ADMIN_USER:-}
+      - JELLYFIN_ADMIN_PASSWORD=${JELLYFIN_ADMIN_PASSWORD:-}
+      # Same values documented in the README; change here to change both.
+      - QBIT_MAX_ACTIVE_DOWNLOADS=4
+      - QBIT_SEED_RATIO_LIMIT=1.0
+      - QBIT_SEED_TIME_LIMIT_MIN=180
+      - INDEXER_MIN_SEEDERS=5
+      - MAX_SIZE_MB_PER_MIN_2160P=252
+    command: sh -c "pip install --no-cache-dir requests pyyaml --quiet && python configure.py"
+
 volumes:
   gluetun-config:
   qbittorrent-config:
+  prowlarr-config:
+  sonarr-config:
+  radarr-config:
+  bazarr-config:
+  sabnzbd-config:
   jellyfin-config:
   jellyfin-cache:

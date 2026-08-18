@@ -2,8 +2,17 @@
 # The .example counterparts ARE committed, so a fresh clone knows what to fill in.
 .env
 gluetun-auth.toml
+recyclarr-config/recyclarr.yml
+
+# Runtime data -- regenerated automatically, no reason to commit.
+# resources/ is Recyclarr's own 73 MB clone of the TRaSH-Guides repo;
+# logs/ is debug output Recyclarr never reads back.
+recyclarr-config/logs/
+recyclarr-config/resources/
+speed-monitor/state/
 
 # Windows / editor noise
 Thumbs.db
 desktop.ini
 *.swp
+setup/__pycache__/

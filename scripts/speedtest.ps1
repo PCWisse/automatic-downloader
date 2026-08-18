@@ -1,13 +1,14 @@
-# Compares raw connection throughput against throughput through the Privado
-# tunnel. Puts NOTHING into a torrent swarm -- your IP is never exposed to
-# peers. This is the safe way to answer "what is the VPN costing me?".
+# Compares raw connection throughput against throughput through the VPN
+# tunnel (whichever provider is configured in .env). Puts NOTHING into a
+# torrent swarm -- your IP is never exposed to peers. This is the safe way
+# to answer "what is the VPN costing me?".
 #
 # Usage:
 #   .\speedtest.ps1            # 25 MB per path (default)
 #   .\speedtest.ps1 -SizeMB 100   # more accurate, uses more of your data cap
 #
-# NOTE: the tunnelled run consumes your Privado allowance (free tier = 10 GB
-# per month). The direct run does not.
+# NOTE: the tunnelled run consumes your VPN provider's data allowance, if it
+# has one (Privado's free tier is 10 GB/month). The direct run does not.
 
 param(
     [int]$SizeMB = 25,
@@ -23,7 +24,7 @@ function Format-Speed([double]$bytesPerSec) {
 
 Write-Host ""
 Write-Host "Speed test: $SizeMB MB x $Runs run(s) per path" -ForegroundColor Cyan
-Write-Host "Tunnelled runs use ~$($SizeMB * $Runs) MB of your Privado allowance." -ForegroundColor DarkGray
+Write-Host "Tunnelled runs use ~$($SizeMB * $Runs) MB of your VPN provider's allowance, if it has one." -ForegroundColor DarkGray
 Write-Host ""
 
 # --- direct -------------------------------------------------------------
@@ -72,7 +73,7 @@ if ($directResults.Count -gt 0) {
 }
 if ($vpnResults.Count -gt 0) {
     $v = ($vpnResults | Measure-Object -Maximum).Maximum
-    Write-Host ("  through Privado   " + (Format-Speed $v))
+    Write-Host ("  through the VPN   " + (Format-Speed $v))
 }
 if ($directResults.Count -gt 0 -and $vpnResults.Count -gt 0) {
     $pct = (1 - ($v / $d)) * 100

@@ -1,4 +1,5 @@
-# Pause / resume the Privado tunnel without recreating containers.
+# Pause / resume the VPN tunnel without recreating containers. Works with
+# whichever provider is configured in .env -- gluetun handles the difference.
 #
 # IMPORTANT -- what "stopped" actually means:
 #   Stopping the tunnel does NOT let qBittorrent connect directly. gluetun's
@@ -20,7 +21,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 # Single source of truth for the key: the auth config gluetun itself reads.
-$authFile = Join-Path $PSScriptRoot "gluetun-auth.toml"
+$authFile = Join-Path (Split-Path $PSScriptRoot -Parent) "gluetun-auth.toml"
 if (-not (Test-Path $authFile)) { Write-Host "gluetun-auth.toml not found" -ForegroundColor Red; exit 1 }
 $m = Select-String -Path $authFile -Pattern '^\s*apikey\s*=\s*"(.+)"' | Select-Object -First 1
 if (-not $m) { Write-Host "no apikey found in gluetun-auth.toml" -ForegroundColor Red; exit 1 }
@@ -48,7 +49,7 @@ switch ($Action) {
             try {
                 $ip = Invoke-RestMethod "$base/publicip/ip" -Headers $headers -TimeoutSec 15
                 Write-Host "Exit node : $($ip.public_ip)  ($($ip.city), $($ip.country))"
-                Write-Host "Note: GeoIP city is often wrong on Privado ranges - trust the IP, not the city." -ForegroundColor DarkGray
+                Write-Host "Note: GeoIP city lookups are often inaccurate on VPN exit ranges - trust the IP, not the city." -ForegroundColor DarkGray
             } catch { Write-Host "(public IP not available yet)" -ForegroundColor Yellow }
         } else {
             Write-Host "qBittorrent currently has NO internet access." -ForegroundColor Yellow

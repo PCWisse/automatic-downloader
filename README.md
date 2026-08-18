@@ -1,81 +1,203 @@
-# qBittorrent behind PrivadoVPN + Jellyfin (Docker)
+# Automated Media Server — Jellyfin + *arr + VPN-protected downloads
 
-Stack location: `C:\docker\downloader` (deliberately **not** under OneDrive)
+A complete self-hosted media stack in Docker. You add a movie or show to a list;
+it finds it, downloads it over a VPN or Usenet, renames it, files it, fetches
+subtitles, and it appears in Jellyfin ready to watch.
 
-The Compose project name is pinned to `downloader` in `docker-compose.yml`, so
-this folder can be renamed or moved freely — see
-[Renaming or moving this folder](#renaming-or-moving-this-folder).
+| Service               | Role                                                                               | URL                                                 |
+| --------------------- | ---------------------------------------------------------------------------------- | --------------------------------------------------- |
+| **Jellyfin**    | Watch your library                                                                 | [http://localhost:8096](http://localhost:8096)       |
+| **Radarr**      | Movies: wanted list, quality rules, imports                                        | [http://localhost:7878](http://localhost:7878)       |
+| **Sonarr**      | TV: same, plus auto-grabs new episodes                                             | [http://localhost:8989](http://localhost:8989)       |
+| **Prowlarr**    | Indexer manager — configure search sites once                                     | [http://localhost:9696](http://localhost:9696)       |
+| **Bazarr**      | Subtitles, automatically                                                           | [http://localhost:6767](http://localhost:6767)       |
+| **SABnzbd**     | Usenet downloader                                                                  | [http://localhost:8080](http://localhost:8080)       |
+| **qBittorrent** | Torrent downloader                                                                 | [http://localhost:8090](http://localhost:8090)       |
+| **gluetun**     | VPN tunnel + kill switch                                                           | [http://localhost:8010](http://localhost:8010) (API) |
+| Byparr                | Anti-bot browser proxy — outside this guide's scope, not wired into Prowlarr here | —                                                  |
+| Recyclarr             | Syncs TRaSH Guides quality profiles into Sonarr/Radarr (scheduled, not a live UI)  | —                                                  |
 
-| | |
-| --- | --- |
-| qBittorrent WebUI | <http://localhost:8090> — **this PC only** |
-| Jellyfin | <http://localhost:8096> — LAN (+ tailnet if you add Tailscale) |
-| gluetun control API | <http://localhost:8010/v1/publicip/ip> — this PC only, API key required |
-| Finished downloads | `D:\Torrents\complete` → `/data/complete` |
-| In progress | `D:\Torrents\incomplete` → `/data/incomplete` |
+Everything except Jellyfin binds to `127.0.0.1` — admin UIs are not exposed to
+your network. Jellyfin listens on all interfaces so phones and TVs can reach it.
+
+**Designed for:** Windows + Docker Desktop (WSL2). Works on Linux with two small
+changes noted in [Running on Linux](#running-on-linux).
+
+> ### 👉 Setting this up for the first time?
+>
+> **Read [ONE-TIME-SETUP.md](ONE-TIME-SETUP.md) instead.** It's a short,
+> copy-paste checklist that gets you running in ~20 minutes.
+>
+> This README is the **reference manual** — it explains every decision, documents
+> what each setting does and why, and is where you come back when something
+> breaks or you want to change how the stack behaves.
+
+---
+
+## How it works
+
+```
+      You add "The Matrix" to Radarr (or to a Trakt/IMDb list it syncs)
+                              │
+                              ▼
+                    ┌──────────────────┐
+                    │      Radarr      │  "who has this?"
+                    │  (or Sonarr/TV)  │────────────────┐
+                    └──────────────────┘                ▼
+                              ▲                  ┌─────────────┐
+                              │  release list    │  Prowlarr   │──► your indexers
+                              └──────────────────│ (behind VPN)│    (torrent + usenet)
+                                                 └─────────────┘
+                              │
+                    picks best match by quality profile
+                              │
+                ┌─────────────┴─────────────┐
+                ▼                           ▼
+        ┌───────────────┐          ┌─────────────────┐
+        │    SABnzbd    │          │   qBittorrent   │
+        │  (usenet,     │          │  (torrents,     │
+        │   direct)     │          │   behind VPN)   │
+        └───────────────┘          └─────────────────┘
+                └─────────────┬─────────────┘
+                              ▼
+              /data/usenet/complete  or  /data/torrents/complete
+                              │
+                     Radarr/Sonarr import:
+                     rename + HARDLINK into
+                              ▼
+                    /data/library/movies|tv
+                              │
+                ┌─────────────┴─────────────┐
+                ▼                           ▼
+        ┌───────────────┐          ┌─────────────────┐
+        │   Jellyfin    │          │     Bazarr      │
+        │  (watch it)   │          │  (subtitles)    │
+        └───────────────┘          └─────────────────┘
+```
+
+**Radarr and Sonarr are the brains; everything else is a tool they drive.** In
+normal use you never open qBittorrent or SABnzbd.
+
+### What goes through the VPN, and what doesn't
+
+| Container         | VPN? | Why                                                                                                            |
+| ----------------- | ---- | -------------------------------------------------------------------------------------------------------------- |
+| qBittorrent       | ✅   | Torrent swarms expose your IP to every peer                                                                    |
+| Prowlarr          | ✅   | Hides which indexer sites you query from your ISP                                                              |
+| Sonarr / Radarr   | ❌   | HTTPS to metadata APIs. Nothing to hide, and the VPN only adds latency                                         |
+| SABnzbd           | ❌   | Usenet is one direct SSL connection to your provider — no swarm. Tunnelling it throws away most of your speed |
+| Jellyfin / Bazarr | ❌   | Must be reachable on your LAN                                                                                  |
+
+qBittorrent and Prowlarr use `network_mode: service:gluetun`, meaning they have
+**no network path except the tunnel**. If the VPN drops they go dark rather than
+falling back to your real connection. That is the kill switch, and it is
+structural — not a setting that can be forgotten.
 
 ---
 
 # QUICK START
 
-Everything below this section is reference material — read it when something
-breaks or when you want to know *why*. This section is the whole job, in order.
+> For a shorter, action-only version of this section, use
+> **[ONE-TIME-SETUP.md](ONE-TIME-SETUP.md)**. What follows is the same process
+> with the reasoning included.
 
-## What is in this folder
-
-| File | Purpose |
-| --- | --- |
-| `docker-compose.yml` | The stack: gluetun (VPN) + qBittorrent + Jellyfin |
-| `.env` | Your Privado credentials. **Secret.** Created from `.env.example` |
-| `.env.example` | Template with placeholders — safe to share |
-| `gluetun-auth.toml` | API key for gluetun's control server. **Secret.** Created from the `.example` |
-| `gluetun-auth.toml.example` | Template with placeholder key — safe to share |
-| `.gitignore` | Keeps `.env` and `gluetun-auth.toml` out of any commit |
-| `check-vpn.ps1` | Leak test + kill-switch test. Run before downloading |
-| `vpn-toggle.ps1` | Pause/resume the tunnel. **Pause, not bypass** — see below |
-| `speedtest.ps1` | Direct vs tunnelled throughput. Exposes nothing |
-| `docker-compose.novpn.yml` | ⚠ Separate no-VPN qBittorrent for benchmarking. **Opt-in only** |
-| `README.md` | This file |
+Steps 1–6 get the stack running (~15 min), then **step 7 runs one command
+that configures everything else automatically**. Steps 8–15 document what that
+script does — you only need to read them for the three things it can't do for
+you (indexers, Usenet provider, subtitle languages).
 
 ## Prerequisites
 
-- **Docker Desktop** with the WSL2 backend, running
-- **A PrivadoVPN account** — the free tier works (10 GB/month)
-- **A drive with space for downloads.** This setup uses `D:\Torrents`. On a
-  different machine, change the two `D:/Torrents...` lines in
-  `docker-compose.yml` and create the folders
-- **An NVIDIA GPU** — *optional*. Without one, delete the `deploy:` block from
-  the jellyfin service or that container will not start
+- **Docker Desktop** with the WSL2 backend (or Docker + Compose v2 on Linux)
+- **A VPN account** — this ships configured for PrivadoVPN, but gluetun supports
+  [most providers](https://github.com/qdm12/gluetun-wiki); see
+  [Using a different VPN provider](#using-a-different-vpn-provider)
+- **Disk space** on a single drive — 4K TV seasons are 50–100 GB each
+- **Optional: an NVIDIA GPU** for hardware transcoding. Without one, delete the
+  `deploy:` block from the `jellyfin` service or that container will not start
+- **Optional: a Usenet subscription** — a provider (~€3–10/mo) *and* an indexer
+  (~€10–15/yr). Without both, skip SABnzbd and use torrents only
 
-## Steps
+## What is in this folder
 
-**1. Create the download folders**
+| File                                                   | Purpose                                                                                                                                                                     |
+| ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ONE-TIME-SETUP.md`                                  | **Start here on a fresh install** — short copy-paste setup checklist                                                                                                 |
+| `docker-compose.yml`                                 | The whole stack                                                                                                                                                             |
+| `docs/docker-compose.annotated.yml`                  | Same stack, fully commented — read this, don't run it. Reference only, may drift from the real file                                                                        |
+| `.env`                                               | Your credentials and paths.**Secret**, git-ignored                                                                                                                    |
+| `.env.example`                                       | Template — copy to`.env`                                                                                                                                                 |
+| `gluetun-auth.toml`                                  | API key for gluetun's control server.**Secret**, git-ignored                                                                                                          |
+| `gluetun-auth.toml.example`                          | Template — copy and generate your own key                                                                                                                                  |
+| `scripts\check-vpn.ps1` / `scripts/check-vpn.sh`   | Leak test + kill-switch test. Run before downloading. Windows/Linux, identical behavior                                                                                     |
+| `scripts\vpn-toggle.ps1` / `scripts/vpn-toggle.sh` | Pause/resume the tunnel. Windows/Linux, identical behavior                                                                                                                  |
+| `scripts\speedtest.ps1` / `scripts/speedtest.sh`   | Direct vs tunnelled throughput. Windows/Linux, identical behavior                                                                                                           |
+| `docker-compose.novpn.yml`                           | ⚠ Full stack, no VPN — an alternative to`docker-compose.yml`, not an addition. See [ONE-TIME-SETUP.md](ONE-TIME-SETUP.md#optional-running-the-whole-stack-without-a-vpn) |
+| `.gitignore`                                         | Keeps both secret files out of commits                                                                                                                                      |
+| `setup/configure.py`                                 | One-shot API-based configurator —`docker compose run --rm setup`. Idempotent                                                                                             |
+| `recyclarr-config/recyclarr.yml`                     | Quality profile sync config for Sonarr/Radarr.**Contains API keys** — same secret status as `.env`                                                                 |
+| `speed-monitor/monitor.py`                           | ⚠ Custom-built, not an off-the-shelf project — see[Download quality and speed controls](#download-quality-and-speed-controls)                                              |
+
+## 1. Create your `.env`
 
 ```
-New-Item -ItemType Directory -Force D:\Torrents\complete, D:\Torrents\incomplete
+Copy-Item .env.example .env
 ```
 
-**2. Put your Privado credentials in `.env`**
+Then edit it. Three things matter:
 
-Copy `.env.example` to `.env` and fill in both values.
+- **VPN credentials** — `.env` ships pre-filled for Privado over OpenVPN
+  (`OPENVPN_USER` / `OPENVPN_PASSWORD`), but any provider gluetun supports
+  works the same way — see [Using a different VPN provider](#using-a-different-vpn-provider).
+  ⚠ Whichever provider you use, these are almost never your website login —
+  most issue a *separate* OpenVPN/WireGuard username on a "manual setup" page
+  in your account dashboard. Privado's is at
+  [app.privadovpn.com/admin-panel](https://app.privadovpn.com/admin-panel). Using
+  your email here is the single most common cause of `AUTH_FAILED`. If the
+  password contains `$`, double it (`$$`) or Compose expands it as a variable.
+- **`MEDIA_ROOT`** — one folder that will hold downloads *and* the library.
+  Forward slashes, no trailing slash (`D:/media`, or `/srv/media` on Linux).
+- **`TZ`** — your timezone.
 
-⚠️ These are **not** your website login. Privado issues a separate OpenVPN
-username on the admin panel at <https://app.privadovpn.com/admin-panel>, with the
-password next to it. Using your email here fails with `AUTH_FAILED`.
-→ *Details: [Setup](#setup)*
+## 2. Create the media folders
 
-**3. Generate your own gluetun API key**
-
-Only needed if you got this folder from someone else — never reuse a shared key.
+Everything must live under one root. On Windows:
 
 ```
+$root = "D:\media"   # must match MEDIA_ROOT in .env
+New-Item -ItemType Directory -Force `
+  "$root\torrents\complete", "$root\torrents\incomplete", `
+  "$root\usenet\complete",   "$root\usenet\incomplete", `
+  "$root\library\movies",    "$root\library\tv"
+```
+
+Resulting layout, identical inside every container as `/data`:
+
+```
+MEDIA_ROOT/               ->  /data
+├── torrents/complete         finished torrents (still seeding)
+├── torrents/incomplete       partial downloads
+├── usenet/complete           finished Usenet downloads
+├── usenet/incomplete         partial Usenet downloads
+└── library/movies|tv         the tidy library Jellyfin reads
+```
+
+**This single-root layout is mandatory**, not cosmetic — see
+[Why one mount](#why-everything-shares-one-mount-hardlinks).
+
+## 3. Generate your own gluetun API key
+
+Never reuse a key from someone else's copy of this repo.
+
+```
+Copy-Item gluetun-auth.toml.example gluetun-auth.toml
 docker run --rm qmcgaw/gluetun:v3 genkey
 ```
 
-Paste the result into the `apikey = "..."` line in `gluetun-auth.toml`.
-→ *Details: [gluetun control API authentication](#gluetun-control-api-authentication)*
+Paste the generated key into **both** `apikey = "..."` lines in
+`gluetun-auth.toml`.
 
-**4. Start the stack**
+## 4. Start the stack
 
 ```
 docker compose up -d
@@ -83,430 +205,639 @@ docker logs -f gluetun
 ```
 
 Wait for `Initialization Sequence Completed` and a public IP line. qBittorrent
-will not start until gluetun is healthy. `AUTH_FAILED` means step 2 is wrong.
+and Prowlarr will not start until gluetun reports healthy — that is deliberate.
 
-**5. Verify the VPN before downloading anything**
+`AUTH_FAILED` means step 1 credentials are wrong.
 
+## 5. Verify the VPN before downloading anything
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\check-vpn.ps1
 ```
-powershell -ExecutionPolicy Bypass -File .\check-vpn.ps1
+
+```bash
+./scripts/check-vpn.sh
 ```
 
-The container's IP must differ from yours. **Do not skip this.**
-→ *Details: [Verify the VPN before downloading](#verify-the-vpn-before-downloading)*
+The container's IP must differ from yours, and stopping gluetun must kill
+qBittorrent's connectivity entirely. **Do not skip this.**
 
-**6. Log in to qBittorrent and set a permanent password**
+## 6. Set a permanent qBittorrent password
+
+This is the one step that **cannot** be automated. qBittorrent generates a
+random temporary password on every restart and prints it **only to its Docker
+log** — not to any file the setup script could read. Reading it would mean
+handing the script access to the Docker socket, which is a much larger
+privilege than this warrants.
 
 ```
 docker logs qbittorrent | Select-String "temporary password" | Select-Object -Last 1
 ```
 
-Open <http://localhost:8090>, log in as `admin`, then **immediately** set your own
-password under *Options → Web UI → Authentication*. Until you do, the password
-changes on every restart and you will get locked out.
-→ *Details: [Setup step 6](#setup)*
+Log in at [http://localhost:8090](http://localhost:8090) as `admin`, then **immediately** set your own
+password under *Options → Web UI → Authentication*. Until you do, every restart
+locks you out and you must re-read the log.
 
-**7. Configure qBittorrent**
-
-- *Options → Downloads*: save to `/data/complete`, incomplete `/data/incomplete`
-- *Options → Connection*: untick UPnP/NAT-PMP (Privado has no port forwarding)
-- *Options → Downloads*: leave *Run external program on completion* empty
-
-→ *Details: [Settings to apply in the WebUI](#settings-to-apply-in-the-webui)*
-
-**8. Set up Jellyfin**
-
-Open <http://localhost:8096>, run the wizard. Library folder is `/media`, content
-type Movies. Turn **on** real-time monitoring; turn **off** *Save artwork into
-media folders* and *Save metadata as NFO* (the mount is read-only).
-
-Then *Dashboard → Playback → Transcoding* → **NVIDIA NVENC** to use the GPU.
-→ *Details: [Jellyfin setup](#jellyfin-setup)*
-
-**9. Watch from your phone or TV** — same network only:
-`http://192.168.50.9:8096` (your LAN IP; `ipconfig` shows the current one).
-
-## Pausing the VPN
+Then put those credentials in `.env`:
 
 ```
-.\vpn-toggle.ps1            # toggle on/off
-.\vpn-toggle.ps1 status     # current state + exit IP, changes nothing
-.\vpn-toggle.ps1 stop
-.\vpn-toggle.ps1 start      # reconnects, then verifies your real IP is not exposed
+QBITTORRENT_USER=admin
+QBITTORRENT_PASSWORD=your-chosen-password
 ```
 
-**There is no speed decision to make here.** "Off" does not mean "download
-faster without the VPN" — it means qBittorrent has **no internet at all**.
-gluetun's firewall stays up when the tunnel stops, so downloads go to 0 B/s, not
-to full speed. Measured directly: with the tunnel stopped, `curl` from inside the
-qbittorrent container returns nothing.
-
-Use it to stop torrent traffic immediately, or to force a reconnect to a
-different Privado server. Not as a performance switch.
-
-### What the VPN actually costs you
-
-Run it yourself — this puts nothing into a torrent swarm:
+## 7. Run the automated setup
 
 ```
-.\speedtest.ps1                 # 25 MB per path
-.\speedtest.ps1 -SizeMB 100     # firmer numbers, more data used
+docker compose run --rm setup
 ```
 
-Measured here (50 MB × 2, best of each):
+This does **everything** in steps 8–13 below — download clients, root folders,
+quality caps, seeder minimums, Prowlarr↔Sonarr/Radarr links, SABnzbd
+categories and whitelist, Bazarr connections, the Jellyfin wizard, libraries,
+NVENC, and a startup trigger on Jellyfin's library scan (see
+[§13](#13-jellyfin--the-library)). It uses each app's own REST API (the same
+calls their web UIs make), so there is no browser automation to break when a
+UI changes.
 
-| Path | Speed |
-| --- | --- |
-| Direct (no VPN) | ~81 MB/s — **649 Mbps** |
-| Through Privado (OpenVPN/UDP) | ~21 MB/s — **167 Mbps** |
-| Tunnel overhead | **~74%** |
+**Safe to re-run at any time.** Every step checks current state first and skips
+or corrects rather than duplicating. Nothing is ever deleted.
 
-That is a big cut, and normal for OpenVPN: single-threaded, encryption in
-userspace. WireGuard loses far less, but gluetun's Privado support is
-OpenVPN-only — switching to a WireGuard-capable provider is the only real fix.
+Two optional `.env` values it will use if present:
 
-**It almost certainly does not matter.** 167 Mbps is well above what a typical
-swarm delivers. Your practical limits are seeder count and the absence of port
-forwarding, not this ceiling. If a torrent is slow, the tunnel is rarely why.
+```
+JELLYFIN_ADMIN_USER=yourname
+JELLYFIN_ADMIN_PASSWORD=your-password
+```
 
-> Only the tunnelled runs consume your Privado allowance (free tier: 10 GB/month).
-> A `-SizeMB 100 -Runs 2` test spends 200 MB of it.
+With those set it completes Jellyfin's first-run wizard and creates both
+libraries automatically. Without them it skips Jellyfin and tells you so.
 
-**Turning the VPN off does not give you the 649 Mbps** — it gives you no
-connectivity at all. To actually measure qBittorrent unprotected, use the
-separate instance below.
+It finishes by listing what still needs you — the things requiring your own
+accounts, which no script can supply:
 
-## Current state of this install
+- **Prowlarr indexers** (step 8) — which sites, plus your credentials
+- **SABnzbd Usenet provider** (step 12) — your paid subscription details
+- **Bazarr languages/providers** (step 14) — your preference
 
-| | |
-| --- | --- |
-| VPN + kill switch | ✅ Working, verified |
-| qBittorrent | ✅ Running, permanent password set |
-| Jellyfin | ✅ Running, GPU passthrough verified |
-| Control API locked down | ✅ API key + localhost-only |
-| **Tailscale / remote access** | ⬜ **Not set up.** Server side is ready — `EnableRemoteAccess` is on and the tailnet subnet is registered. Only the Tailscale install is left, whenever you want it → [Tailscale setup](#tailscale-setup) |
-| HTTPS | ⬜ Not set up. Everything is plain HTTP on the LAN. The tidy fix is `tailscale serve`, which comes free with the step above |
+Everything else is done. Steps 9–11 and 13 below are kept as reference for
+what the script configured, and for anyone who prefers doing it by hand.
+
+## 8. Prowlarr — add your indexers
+
+[http://localhost:9696](http://localhost:9696) → **Indexers → Add Indexer**.
+
+This is the one step nobody can do for you: Prowlarr can only search sites you
+have access to. Add your torrent trackers and/or Usenet indexers here. This is
+the **only** place indexers get configured — Sonarr and Radarr inherit them.
+
+Some public indexers sit behind Cloudflare bot protection and fail with
+`blocked by CloudFlare Protection`. That is the site deliberately refusing
+automated access. Use an indexer you have proper access to instead — a Usenet
+indexer you subscribe to, or a tracker with a working API.
+
+## 9. Prowlarr — push indexers to Sonarr and Radarr
+
+Still in Prowlarr: **Settings → Apps → Add**, once for Sonarr and once for Radarr.
+
+| Field                | Sonarr                  | Radarr                  |
+| -------------------- | ----------------------- | ----------------------- |
+| Prowlarr Server      | `http://gluetun:9696` | `http://gluetun:9696` |
+| Sonarr/Radarr Server | `http://sonarr:8989`  | `http://radarr:7878`  |
+| API Key              | *see below*           | *see below*           |
+
+⚠ **Prowlarr Server must be `http://gluetun:9696`, not `localhost`.** This field
+is the address *Sonarr/Radarr* use to call back to Prowlarr — and Sonarr/Radarr
+live in a different network namespace than Prowlarr. From their side,
+`localhost` means themselves, not Prowlarr, and the field fails validation with
+`Invalid Url: 'http://localhost:9696'`. Since Prowlarr shares gluetun's
+namespace, `gluetun` is the correct address — verified: `curl http://gluetun:9696`
+from inside the Radarr container returns `200`, while `localhost:9696` from the
+same container gets connection refused.
+
+Find each API key in that app's **Settings → General**, or from the command line:
+
+```
+docker exec sonarr grep -o '<ApiKey>[^<]*</ApiKey>' /config/config.xml
+docker exec radarr grep -o '<ApiKey>[^<]*</ApiKey>' /config/config.xml
+```
+
+⚠ Use the **container names** (`sonarr`, `radarr`), never `localhost`. Prowlarr
+runs inside gluetun's network namespace, so `localhost` there is the VPN
+container, not your PC.
+
+Hit **Test**, then **Sync App Indexers**.
+
+## 10. Sonarr and Radarr — add download clients
+
+In **both** apps: **Settings → Download Clients → Add**.
+
+**qBittorrent** — it lives behind the VPN, so address it as `gluetun`. Its
+**Category** field (e.g. `tv-sonarr` in Sonarr, `radarr` in Radarr) does not
+need to match anything — qBittorrent creates categories on the fly, and each
+app's category only needs to be distinct so downloads from Sonarr and Radarr
+stay distinguishable in one shared qBittorrent instance:
+
+| Field               | Value                      |
+| ------------------- | -------------------------- |
+| Host                | `gluetun`                |
+| Port                | `8090`                   |
+| Username / Password | the ones you set in step 6 |
+
+**SABnzbd** (skip if not using Usenet):
+
+| Field    | Value                                 |
+| -------- | ------------------------------------- |
+| Host     | `sabnzbd`                           |
+| Port     | `8080`                              |
+| Category | `tv` (Sonarr) / `movies` (Radarr) |
+| API Key  | from SABnzbd →*Config → General*  |
+
+The API key exists from first boot, even before step 11's provider setup — so
+this step can be done now, in any order relative to step 11.
+
+⚠ **Unlike qBittorrent, SABnzbd will not create the category for you** — it
+must already exist in SABnzbd, or the connection fails with `Category does not exist`. Create it first: SABnzbd → **Config → Categories → Add Category**,
+name it exactly `tv` (or `movies` for Radarr), save. Do this before adding
+SABnzbd as a download client, not after.
+
+⚠ If the connection test instead fails with `401`/`Access denied`, SABnzbd's
+`host_whitelist` doesn't yet include `sabnzbd` (the hostname Sonarr/Radarr
+connect with) — only whatever host it was first opened from. Fix in SABnzbd:
+**Config → General → Host whitelist**, add `sabnzbd`, save, restart the
+container.
+
+With both clients added, open **each one's own edit screen** (click its name
+in the Download Clients list — this is not a separate global setting) and set
+its **Client Priority** field: SABnzbd `1`, qBittorrent `2`, in both Sonarr and
+Radarr. Lower number is tried first, so Usenet is attempted before torrents —
+faster, and it doesn't depend on seeders. Don't confuse this field with
+*Recent Priority* / *Older Priority* on the same screen, which control
+something else (how eagerly to grab very new vs. older releases).
+
+## 11. Sonarr and Radarr — set root folders
+
+**Settings → Media Management → Root Folders**:
+
+- Sonarr → `/data/library/tv`
+- Radarr → `/data/library/movies`
+
+Leave *Use Hardlinks instead of Copy* **on**. It is the entire reason for the
+single-root layout.
+
+## 12. SABnzbd — your Usenet provider
+
+[http://localhost:8080](http://localhost:8080), run the wizard, enter your provider's server details.
+Then **Config → Folders**:
+
+- Temporary Download Folder: `/data/usenet/incomplete`
+- Completed Download Folder: `/data/usenet/complete`
+
+## 13. Jellyfin — the library
+
+[http://localhost:8096](http://localhost:8096). Run the wizard and create your admin user — pick a real
+password, there is no temporary-password fallback and resetting it means editing
+the database.
+
+Add **two** libraries:
+
+| Content type | Folder            |
+| ------------ | ----------------- |
+| Movies       | `/media/movies` |
+| Shows        | `/media/tv`     |
+
+In each library's settings:
+
+| Setting                         | Value         | Why                                                                     |
+| ------------------------------- | ------------- | ----------------------------------------------------------------------- |
+| Enable real time monitoring     | **on**  | New imports appear automatically                                        |
+| Save artwork into media folders | **off** | `/media` is read-only — leaving it on logs write failures every scan |
+| Save metadata as NFO            | **off** | Same reason                                                             |
+
+At the **Remote access** step: leave *Allow remote connections* ticked, but
+**untick "Enable automatic port mapping"** (that is UPnP —
+see [Remote access](#remote-access-to-jellyfin)).
+
+Then **Dashboard → Scheduled Tasks → Scan Media Library** — set it to run every
+few hours as a backstop, and add a trigger to run it **on application startup**.
+Real-time monitoring only sees writes made from inside a container, so a
+host-side copy (e.g. from Windows Explorer) won't show up until the next scan
+or restart.
+
+If you ran the [automated setup](#7-run-the-automated-setup), both of these
+are already done — it adds a startup trigger to the existing scan schedule and
+leaves the interval trigger in place as the backstop.
+
+If you have an NVIDIA GPU: **Dashboard → Playback → Transcoding** →
+[enable NVENC](#hardware-transcoding).
+
+## 14. Bazarr — subtitles
+
+[http://localhost:6767](http://localhost:6767) → **Settings → Sonarr** and **Settings → Radarr**:
+
+| Field   | Sonarr         | Radarr         |
+| ------- | -------------- | -------------- |
+| Address | `sonarr`     | `radarr`     |
+| Port    | `8989`       | `7878`       |
+| API Key | same as step 8 | same as step 8 |
+
+Then **Settings → Languages** to choose your subtitle languages and create a
+profile, and **Settings → Providers** to add subtitle sources (OpenSubtitles etc).
+
+## 15. Let your phone reach Jellyfin
+
+Docker publishes port 8096, but **Windows Firewall still blocks inbound
+connections by default** — Docker Desktop does not create an exception for
+WSL2-published ports. Without this rule, no device can connect.
+
+In an **elevated** PowerShell (Run as Administrator):
+
+```
+New-NetFirewallRule -DisplayName "Jellyfin (8096)" -Direction Inbound -Protocol TCP -LocalPort 8096 -Action Allow -Profile Private
+```
+
+Find your LAN IP:
+
+```
+Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.PrefixOrigin -eq 'Dhcp' } | Select-Object IPAddress, InterfaceAlias
+```
+
+Then browse to `http://<that-ip>:8096` from your phone.
+
+See [Jellyfin shows several servers](#jellyfin-shows-several-servers-and-none-work)
+if the mobile app discovers multiple entries.
+
+---
+
+# USING IT
+
+## Adding media — you do not add things one at a time
+
+Radarr and Sonarr both support **Import Lists**: point them at a list, and they
+automatically add *and download* everything on it, then keep syncing as the list
+changes.
+
+**Settings → Import Lists → Add.** Available sources include:
+
+| Source                                         | Use case                                                      |
+| ---------------------------------------------- | ------------------------------------------------------------- |
+| **Trakt List / Trakt User**              | The best option. Keep a list on trakt.tv, add from your phone |
+| **IMDb Lists**                           | Any public IMDb list URL                                      |
+| **TMDb List / TMDb User**                | Same via TMDb                                                 |
+| **TMDb Popular / Trakt Popular**         | "Always have the current top 10", fully automatic             |
+| **Plex Watchlist**, Simkl, StevenLu, RSS | Other sources                                                 |
+
+Set **Search on Add = yes** and it downloads immediately.
+
+Your workflow becomes: *add a film to a Trakt list on your phone → it appears in
+Jellyfin later*. For TV, Sonarr additionally monitors ongoing series and grabs
+new episodes the night they air.
+
+For one-offs, **Movies → Add New** (Radarr) or **Series → Add New** (Sonarr)
+still works fine.
+
+### Adding a request UI (optional)
+
+**Jellyseerr** gives housemates/family a friendly "request a movie" page that
+feeds straight into Radarr/Sonarr. Worth it only if other people will use the
+server; skip for solo use.
 
 ## Everyday commands
 
 ```
-docker compose up -d                       # start
-docker compose down                        # stop
-docker compose pull; docker compose up -d  # update
-docker compose restart qbittorrent         # ALWAYS run this after touching gluetun
+docker compose up -d                       # start everything
+docker compose down                        # stop everything
+docker compose pull; docker compose up -d  # update all images
+docker compose logs -f sonarr              # follow one service
 ```
 
-That last one is not optional — [here is why](#why-gluetun-always-needs-docker-compose-restart-qbittorrent-after-it).
+⚠ **After touching gluetun alone, always restart its dependants:**
+
+```
+docker compose restart qbittorrent prowlarr
+```
+
+[Why this is mandatory](#why-gluetun-changes-need-a-qbittorrentprowlarr-restart).
+
+## Optional extras
+
+**Recyclarr** — syncs [TRaSH Guides](https://trash-guides.info/) quality
+profiles into Sonarr/Radarr. Your quality profile (`HD-1080p` etc.) only
+controls *resolution*; Recyclarr adds **custom formats** that score releases on
+encode quality, audio, and release-group reputation — filtering out fakes and
+bad encodes automatically. It's a scheduled sync tool, not a live-running
+service — a container that wakes up on a cron schedule, syncs, and goes back to
+sleep. Already included in `docker-compose.yml`, config at
+`recyclarr-config/recyclarr.yml`.
+
+Setup:
+
+1. Put your Sonarr/Radarr API keys and container URLs (`http://sonarr:8989`,
+   `http://radarr:7878`) into `recyclarr-config/recyclarr.yml`
+2. Pick a quality profile from the guide and put its `trash_id` in the config.
+   **Get the current, correct ID from Recyclarr itself** — the guide changes,
+   and a stale ID from a blog post or an old guide page will fail:
+
+   ```
+   docker exec -t recyclarr recyclarr list quality-profiles sonarr
+   docker exec -t recyclarr recyclarr list quality-profiles radarr
+   ```
+
+   (`-t` is required — without a TTY these commands print nothing.)
+3. Check it resolves before touching anything live:
+
+   ```
+   docker exec recyclarr recyclarr sync sonarr --preview
+   ```
+4. Then sync for real:
+
+   ```
+   docker exec recyclarr recyclarr sync
+   ```
+
+Verify it actually landed — a clean exit code alone doesn't confirm the sync
+did anything:
+
+```
+curl -s http://localhost:8989/api/v3/qualityprofile -H "X-Api-Key: <sonarr key>"
+```
+
+Your new profile should appear in that list, and `/api/v3/customformat` should
+return dozens of entries instead of zero. After the first sync, it repeats
+automatically on `CRON_SCHEDULE` (default: daily at 03:00, set in
+`docker-compose.yml`) — no need to run it by hand again.
+
+**Jellyseerr** — a request UI so family/housemates can ask for a film and have
+it feed straight into Radarr/Sonarr, without giving them admin access. Worth it
+only if other people use the server. A ready-to-use (commented-out) service
+block already exists at the bottom of `docker-compose.yml` — uncomment it and
+`docker compose up -d` to add it.
+
+## Download quality and speed controls
+
+Three separate mechanisms, each catching a different failure mode. They run
+independently but stack together — a release has to clear all three to end up
+watchable in reasonable time. All three are optional; the stack works without
+them, just with less protection against bad picks.
+
+```
+Sonarr/Radarr searches indexers
+        │
+        ▼
+①  Seeder minimum (Prowlarr/indexer setting)
+    rejects weakly-seeded torrents BEFORE grab
+        │  survives
+        ▼
+②  Quality Definition size cap (Sonarr/Radarr setting)
+    rejects oversized releases (e.g. remuxes) BEFORE grab
+        │  survives — release is grabbed, download starts
+        ▼
+③  speed-monitor (custom container, this repo only)
+    watches the LIVE download after grab; if it stalls,
+    un-grabs it and triggers a new search
+```
+
+### ① Seeder minimum — filters before grab
+
+Each indexer has a **Minimum Seeders** field (Sonarr/Radarr → *Settings →
+Indexers → click an indexer*). Default is `1`, which is barely a filter — a
+1-seeder torrent almost always crawls. Currently set to **`5`** across all
+torrent indexers in both apps. Low seeders is the single strongest predictor of
+a slow torrent available *before* anything downloads, which is why it's the
+first line of defense.
+
+Doesn't apply to Usenet (SABnzbd) — there's no seeder concept there.
+
+### ② Quality Definition size cap — filters before grab
+
+**Settings → Quality → [tier]** (e.g. `Bluray-2160p Remux`) has a **Max Size**
+field, expressed as **MB per minute of runtime**, not a flat file size —
+Sonarr/Radarr compute the actual GB limit per episode/movie using each item's
+real runtime.
+
+Currently set on Sonarr to **252 MB/min** (≈15 GB for a 61-minute episode)
+across every 2160p tier — `HDTV-2160p`, `WEBRip-2160p`, `WEBDL-2160p`,
+`Bluray-2160p`, `Bluray-2160p Remux`. This is a **global** setting per app, not
+per-profile — it affects every quality profile in Sonarr, not just one show.
+Radarr has its own separate Quality Definitions if you want the same treatment
+for movies (2-hour films need a different MB/min value than 61-minute
+episodes — recompute rather than reuse Sonarr's number).
+
+Worth knowing: `Bluray-2160p Remux` has a **floor** of 187.4 MB/min (its
+minimum possible size) — with a 252 MB/min ceiling, only a narrow window
+survives, and for episodes over ~68 minutes even the floor exceeds the cap. In
+practice this means remux releases are excluded almost entirely, which is the
+intended effect: remuxes are minimally compressed and were the direct cause of
+a 262 GB/season release before this cap existed.
+
+To change the number: recompute for your episode length —
+`(desired_GB × 1024) / minutes = MB/min`.
+
+### ③ speed-monitor — watches live, after grab
+
+⚠ **Unlike everything else in this repo, this is custom-built for this
+specific setup — not an off-the-shelf project.** It's the one piece most
+likely to need a tweak or a fix later. Read `speed-monitor/monitor.py` before
+trusting it blindly.
+
+**What it solves:** ① and ② only evaluate a release *before* it downloads.
+Neither catches a release that looked fine on paper (decent seeders, sane
+size) but turns out to crawl in practice — a throttled source, a swarm that
+evaporates, etc. speed-monitor is a small container that polls qBittorrent's
+live API and reacts to what's actually happening, not what was predicted.
+
+#### A real incident, and why the design looks the way it does
+
+The first version of this script **deleted** a slow download outright and
+blocklisted it on every retry, with no memory of having tried before. Combined
+with raising `max_active_downloads` (more concurrent downloads = less
+bandwidth each, more of them individually look "slow" at once), it thrashed
+for about 5 hours: every Season 4 episode of a real show got killed and
+re-grabbed **twice**, 22 perfectly viable releases ended up wrongly
+blocklisted, and nothing ever finished. Recovery meant clearing the blocklist
+and starting over.
+
+The current design exists specifically to make that failure mode structurally
+impossible, not just less likely:
+
+1. Poll qBittorrent every `POLL_INTERVAL_SECONDS` (default 60s) for active downloads
+2. Ignore anything younger than `GRACE_PERIOD_SECONDS` (default 10 min) — early
+   peer discovery is normally slow and shouldn't be punished
+3. Ignore anything already past `PROGRESS_GUARD` (default 20%) — a download
+   that's made real progress is never touched for being slow, no matter how
+   long. Restarting a mostly-finished download to chase an unknown
+   replacement is a bad trade
+4. If a download is **continuously** below `SPEED_THRESHOLD_BPS` (default
+   0.5 MiB/s) for `SUSTAINED_SECONDS` (default 15 min), it is **stopped** —
+   `POST /api/v2/torrents/stop` — never deleted, never blocklisted. Recovering
+   above the threshold even briefly resets the clock; only a genuinely
+   sustained stall counts
+5. A **different** release for the same episode/movie is fetched fresh via
+   `GET /api/v3/release` and grabbed via `POST /api/v3/release` — the same
+   two-step flow Sonarr/Radarr's own "Interactive Search" UI uses internally.
+   Already-tried release titles and anything Sonarr/Radarr already rejected
+   are skipped
+6. After `MAX_RETRIES` stopped attempts (default 2) on the *same* episode or
+   movie, whichever stopped candidate got the **furthest progress** is
+   resumed — `POST /api/v2/torrents/start` — and treated as the final answer.
+   The others are left stopped, exactly as they were, for you to clean up
+   manually if you want the disk space back. This episode is then never
+   auto-managed again, even if the resumed one is later slow too
+
+qBittorrent 5.x renamed pause/resume to stop/start **at the API level, not
+just in the UI** — `/api/v2/torrents/pause` is a 404 on this version.
+Confirmed directly with curl before writing this, since guessing the older
+name once already cost real debugging time.
+
+**Nothing is ever deleted automatically.** The worst case is a few stopped,
+harmless torrents sitting idle in qBittorrent until you clear them by hand —
+not lost progress, not a wrongful blocklist.
+
+**Deliberately not covered:** Usenet (SABnzbd). There's no seeder-style signal
+and no alternate release to fall back to the way torrents have — a slow
+Usenet download is just your provider's connection, not a bad pick.
+
+**Manually stopping a download yourself is always safe.** speed-monitor only
+evaluates torrents in an active state (`downloading`, `stalledDL`, `metaDL`,
+`forcedDL`). The moment you stop one yourself, its state becomes `stoppedDL` —
+outside that set — so it's skipped entirely on the next poll, with or without
+this redesign.
+
+**Config** (`docker-compose.yml`, `speed-monitor` service environment):
+
+| Variable                  | Default                | Meaning                                                                    |
+| ------------------------- | ---------------------- | -------------------------------------------------------------------------- |
+| `SPEED_THRESHOLD_BPS`   | `524288` (0.5 MiB/s) | Below this = "slow"                                                        |
+| `SUSTAINED_SECONDS`     | `900` (15 min)       | How long "slow" must persist before acting                                 |
+| `GRACE_PERIOD_SECONDS`  | `600` (10 min)       | Downloads younger than this are never evaluated                            |
+| `PROGRESS_GUARD`        | `0.20` (20%)         | Downloads past this progress are never touched                             |
+| `MAX_RETRIES`           | `2`                  | Stopped attempts allowed before picking the best and giving up on the rest |
+| `POLL_INTERVAL_SECONDS` | `60`                 | How often it checks                                                        |
+
+**Watch it work:**
+
+```
+docker logs -f speed-monitor
+```
+
+Every active download prints its current speed, progress, and how long it's
+been slow, so you can see a threshold breach — and the resulting alternative
+grab, or the final decision — coming before it happens.
+
+**State persists** to `speed-monitor/state/retry_state.json`, so a container
+restart doesn't forget which episodes have already been retried and silently
+allow re-litigating them from scratch.
+
+**Credentials:** needs its own qBittorrent WebUI login (`QBITTORRENT_USER` /
+`QBITTORRENT_PASSWORD` in `.env`) plus Sonarr/Radarr API keys
+(`SONARR_API_KEY` / `RADARR_API_KEY` in `.env`) — the app-level API keys
+already used elsewhere don't grant qBittorrent access, and vice versa.
+
+## Live app settings not stored in this repo
+
+Everything above this point lives in `docker-compose.yml`, `.env`, or a file
+under version control — clone this repo elsewhere, `docker compose up -d`,
+and it comes back automatically. **The settings below do not.** They live
+inside each app's own database, in a named Docker volume
+(`sonarr-config`, `qbittorrent-config`, etc.). That means they:
+
+- ✅ survive a container restart, `docker compose down` / `up`, even Docker
+  Desktop itself going down and back up
+- ❌ do **not** survive `docker compose down -v`, a deleted volume, or a fresh
+  clone on a different machine — nothing in git recreates them
+
+If you ever rebuild from scratch, or the numbers below look wrong and you're
+not sure why, this is the checklist to redo.
+
+**qBittorrent** (Options → BitTorrent, unless noted):
+
+| Setting                  | Value                                       | Why                                                                                                                                                                                                    |
+| ------------------------ | ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Maximum active downloads | `4`                                       | Past this, qBittorrent's global 500-connection cap gets divided so thin per-torrent that already-weak swarms get starved further — see[What the VPN costs you](#what-the-vpn-costs-you) era discussion |
+| Ratio limit              | `1.0`, action **Stop** (not remove) | Stops seeding automatically; "Stop" preserves the file, only "Remove" would delete it                                                                                                                  |
+| Seeding time limit       | `180` minutes                             | Backstop in case ratio is never reached                                                                                                                                                                |
+
+**Sonarr → Settings → Quality → Quality Definitions** — max size, in **MB per
+minute of runtime** (not a flat GB figure):
+
+| Quality                                                                 | Max size                                                                                                  |
+| ----------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| HDTV-2160p, WEBRip-2160p, WEBDL-2160p, Bluray-2160p, Bluray-2160p Remux | `252` (≈15 GB for a 61-minute episode — recompute for different runtimes: `(GB × 1024) / minutes`) |
+
+⚠ **Radarr's equivalent Quality Definitions were never actually set** — movies
+currently have no size cap. If you want the same protection there, set it
+yourself using Radarr's own runtime math (movies run ~2 hours, so the same
+252 MB/min would allow ~30 GB — decide what's actually reasonable for film
+remuxes before copying the TV number).
+
+**Prowlarr → Settings → Apps** — for both the Sonarr and Radarr entries:
+
+| Field      | Value                                                 | Why                                                                                                                                                                                                                                                                                                                                                                        |
+| ---------- | ----------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Sync Level | **`Add Only`**, not the default `Full Sync` | `Full Sync` periodically pushes Prowlarr's indexer list down to Sonarr/Radarr and **overwrites** app-specific fields Prowlarr doesn't track — confirmed directly: this silently reset the seeder minimum below back to `1` without any error or warning. `Add Only` still lets Prowlarr push new indexers, it just stops clobbering settings on existing ones |
+
+**Sonarr AND Radarr → Settings → Indexers**, each torrent indexer:
+
+| Field           | Value |
+| --------------- | ----- |
+| Minimum Seeders | `5` |
+
+**SABnzbd → Config**:
+
+| Setting                            | Value                                                                                            |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------ |
+| Categories (Config → Categories)  | `tv`, `movies` — required, Sonarr/Radarr fail with `Category does not exist` without them |
+| Host whitelist (Config → General) | must include`sabnzbd` — Sonarr/Radarr connect using that hostname, not `localhost`          |
 
 ---
 
 # REFERENCE
 
-## How it works
+## Why everything shares one mount (hardlinks)
 
-`gluetun` builds the OpenVPN tunnel to Privado and owns the network namespace.
-qBittorrent joins that namespace with `network_mode: service:gluetun`, so it has
-**no network path except the tunnel**. If the VPN drops, qBittorrent goes dark —
-it cannot fall back to your home connection. That is the kill switch.
+Sonarr and Radarr "import" by creating a **hardlink** — a second directory entry
+pointing at the same bytes on disk. It is instant, uses no extra space, and
+leaves the original where it is so qBittorrent can keep seeding.
 
-The WebUI port is published on `gluetun`, not on `qbittorrent`. This is required:
-a container sharing another's namespace cannot publish ports of its own.
-
-### Changing the ports
-
-The defaults 8080 and 8000 were moved to **8090** and **8010** on purpose — both
-are heavily contested on a dev machine (8080: Tomcat, webpack, Spring Boot;
-8000: Django, uvicorn, `python -m http.server`). To change them again, edit
-**two** things per port and keep them in sync:
-
-| Port | Publish on `gluetun` | Matching setting |
-| --- | --- | --- |
-| qBittorrent WebUI | `ports: - 127.0.0.1:8090:8090` | `WEBUI_PORT=8090` on the **qbittorrent** service |
-| gluetun control API | `ports: - 127.0.0.1:8010:8010` | `HTTP_CONTROL_SERVER_ADDRESS=:8010` on **gluetun** |
-
-The `127.0.0.1:` prefix restricts each to this machine — see
-[Security](#security-what-is-exposed-to-whom). Remove it to expose on the LAN.
-
-Then:
+Hardlinks only work **within a single filesystem mount**. Verified on this setup:
 
 ```
-docker compose up -d
-docker compose restart qbittorrent
+ln /data/torrents/complete/file.mkv /data/library/movies/file.mkv
+-> links=2  inode=2251799814069397   (same inode = one copy of the data)
 ```
 
-Two gotchas: the `ports:` entry always goes on **gluetun**, never on
-`qbittorrent` — Docker hard-errors otherwise. And `WEBUI_PORT` is passed to
-qBittorrent as a `--webui-port` command-line flag, so it overrides the port
-stored in `qBittorrent.conf`; do not try to change the port from inside the WebUI
-as well, or the two will disagree.
-
-Jellyfin is independent — it has its own namespace, so its `8096:8096` can be
-changed on the jellyfin service directly with nothing to keep in sync.
-
-**Jellyfin is deliberately *not* behind the VPN.** It has its own normal network
-namespace and its own published port. It needs to be reachable from your LAN and
-to fetch artwork and metadata; routing it through Privado would break both, and
-there is nothing to hide about serving your own files to yourself. Only the
-torrent traffic needs the tunnel.
-
-### Why qBittorrent uses one mount (`/data`) and not two
-
-This matters for Jellyfin, and it is not obvious. `D:/Torrents/complete` and
-`D:/Torrents/incomplete` as two separate bind mounts are **cross-device** as far
-as Linux is concerned, even though they are on the same physical drive — verified
-here with a hardlink test:
+Mount downloads and library separately and it breaks:
 
 ```
-ln: failed to create hard link '/downloads/lt' => '/incomplete/lt': Cross-device link
+ln: failed to create hard link ... : Cross-device link
 ```
 
-`rename(2)` fails with `EXDEV` across mount points, so qBittorrent falls back to
-copy-then-delete when a torrent finishes. During that copy the file exists in the
-completed folder at partial, growing size — and Jellyfin's watcher fires on the
-*start* of the copy. You get a library entry for a truncated 20 GB file.
-
-Mounting `D:/Torrents:/data` once makes the finish an atomic rename, so the file
-appears in `/data/complete` fully formed or not at all. Jellyfin also never sees
-`/data/incomplete`, because only `complete` is mounted into it.
-
-## Setup
-
-1. Edit `.env` **before the first `docker compose up`** — it ships with
-   placeholders, and starting with those leaves gluetun in an auth-failure
-   restart loop against Privado (`AUTH_FAILED` in the logs).
-
-   ```
-   PRIVADO_USER=...
-   PRIVADO_PASSWORD=...
-   ```
-
-   **These are not your website login.** Privado issues a separate OpenVPN
-   username on the admin panel at <https://app.privadovpn.com/admin-panel>, with
-   the password shown next to it. Their docs are explicit: your email address
-   cannot be used as the username for manual setup.
-
-   If the password contains a `$`, double it (`$$`) or Docker Compose will try to
-   expand it as a variable.
-
-2. Start it:
-
-   ```
-   docker compose up -d
-   ```
-
-3. Watch the tunnel come up:
-
-   ```
-   docker logs -f gluetun
-   ```
-
-   You want to see `INFO [vpn] You are running ... ` and a public IP line.
-   qBittorrent will not start until gluetun reports healthy.
-
-4. Get the temporary WebUI password — linuxserver generates a random one on first
-   run and it is **only** in the log:
-
-   ```
-   docker logs qbittorrent | Select-String -Pattern "password"
-   ```
-
-5. Open <http://localhost:8090>, log in as `admin` with that password.
-
-6. **Set a permanent password immediately** — **Options -> Web UI ->
-   Authentication**, choose your own username and password, Save.
-
-   This is not optional housekeeping. Until a real password is stored,
-   qBittorrent generates a **new random temporary password on every container
-   restart**, and the previous one stops working. Any restart of the stack —
-   including `docker compose restart qbittorrent` after touching gluetun — locks
-   you out until you re-read the log. Setting a password once ends this.
-
-   To recover the current temporary password at any time:
-
-   ```
-   docker logs qbittorrent | Select-String "temporary password" | Select-Object -Last 1
-   ```
-
-## Settings to apply in the WebUI
-
-Privado has **no port forwarding on any plan**, so incoming connections will never
-work. Configure for that instead of letting it retry forever:
-
-- **Options -> Connection**: uncheck *Use UPnP / NAT-PMP port forwarding from my router*
-- **Options -> Advanced -> Network interface**: optionally set to `tun0`. This is
-  belt-and-braces only — the shared namespace already guarantees the binding — and
-  it is the one setting that can lock you out of your own client. See recovery
-  below before using it.
-- **Options -> Downloads**: Save files to `/data/complete`, tick *Keep incomplete
-  torrents in* → `/data/incomplete`. Use these container paths, never `D:\...` —
-  qBittorrent cannot see Windows paths.
-- **Options -> Downloads**: leave *Run external program on torrent completion*
-  **empty** (see the virus section below)
-- **Options -> BitTorrent**: enable encryption if you like; leave DHT/PeX on
-
-Practical effect: downloads are fine, seeding is weak (you can only connect
-outbound to peers). If ratio matters to you, a provider with port forwarding
-(Proton, AirVPN, PIA) would serve you better — gluetun supports those too and only
-the `gluetun` environment block would change.
-
-## Jellyfin setup
-
-### 1. Run the first-start wizard
-
-Open <http://localhost:8096>.
-
-**Language** — pick yours, Next.
-
-**Create your admin user** — a username and password of your choosing. This
-account is Jellyfin's own; it has nothing to do with qBittorrent or Privado.
-Choose a real password now: unlike qBittorrent there is no temporary-password
-fallback, and resetting it later means editing Jellyfin's database.
-
-### 2. Add the media library
-
-**Add Media Library**, in the wizard:
-
-- **Content type**: `Movies`
-- **Display name**: `Movies`
-- **Folders**: click **+**, navigate to `/media`, select it
-  (`/media` is `D:\Torrents\complete`, mounted read-only)
-
-Then scroll down inside that same dialog:
-
-| Setting | Value | Why |
-| --- | --- | --- |
-| Enable real time monitoring | **on** | This is what makes new downloads appear automatically |
-| Save artwork into media folders | **off** | `/media` is read-only — leaving it on logs write failures every scan |
-| Save metadata as NFO | **off** | Same reason |
-
-Metadata and artwork go into Jellyfin's own config volume instead, which is where
-you want them anyway.
-
-**Metadata language** — set your preference. English usually gives the best match
-rate even if you run the UI in Dutch.
-
-**Remote access** — leave *Allow remote connections* ticked, but **untick
-"Enable automatic port mapping"**. That is UPnP and it does nothing useful here.
-
-Finish, then log in with the account you just created.
-
-### 3. Set the scan backstop
-
-**Dashboard → Scheduled Tasks → Scan Media Library** — set the interval trigger
-to every few hours. Real-time monitoring should catch downloads, but this covers
-anything it misses and anything you drop in from Explorer. See below for why
-those two cases differ.
-
-### 4. Watching from other devices
-
-On any device on the same network:
-
-```
-http://192.168.50.9:8096
-```
-
-(That is this machine's LAN IP — it can change if your router hands out a new
-lease. `ipconfig` will tell you the current one.)
-
-Official Jellyfin apps exist for Android, iOS, Android TV and any web browser.
-Nothing is exposed to the internet, which is the right default — this is LAN-only.
-
-### A note on file naming
-
-Jellyfin matches on title and year, so a typical release folder name usually
-works. If something is not identified, rename the folder to `Movie Name (Year)` —
-the format it parses most reliably — or use **Identify** on the item to fix the
-match by hand.
-
-If you will download TV as well as films, make `D:\Torrents\complete\Movies` and
-`D:\Torrents\complete\Shows`, use qBittorrent **categories** to route downloads
-into each, and add a second Jellyfin library with content type *Shows*. Mixing
-both in one folder makes matching noticeably worse.
-
-### Deleting media
-
-The read-only mount means Jellyfin's "delete media" button will not work. That is
-intentional — deleting a file qBittorrent is still seeding breaks the torrent.
-**Delete through qBittorrent, not through Jellyfin or Explorer.**
-
-### Will it pick up new downloads automatically?
-
-Yes, but the reason is subtle and worth recording. Filesystem watching on Windows
-bind mounts is unreliable — tested here directly:
-
-| Write origin | inotify event seen by another container |
-| --- | --- |
-| From Windows (Explorer / PowerShell) | **no** |
-| From inside a container | **yes** |
-
-qBittorrent writes from inside a container, so its completed files *do* generate
-events and Jellyfin's real-time monitoring sees them. Files you drag into
-`D:\Torrents\complete` from Explorer will **not** be noticed — those need a scan.
-
-Because Jellyfin's watcher is its own implementation and historically flaky on
-non-native filesystems, keep a backstop: **Dashboard → Scheduled Tasks → Scan
-Media Library**, set it to run every few hours. Costs nothing and covers both the
-Explorer case and any missed event.
-
-**Test the watcher once your library exists** — this fakes a completed torrent
-without downloading anything:
-
-```
-docker exec qbittorrent sh -c "mkdir -p /data/incomplete/WatcherTest && dd if=/dev/urandom of=/data/incomplete/WatcherTest/probe.mkv bs=1M count=8 2>/dev/null && mv /data/incomplete/WatcherTest /data/complete/WatcherTest && echo moved"
-```
-
-Wait about a minute, then:
-
-```
-docker logs jellyfin --tail 60 | Select-String -Pattern "Library|scan|WatcherTest"
-```
-
-Clean up afterwards:
-
-```
-docker exec qbittorrent rm -rf /data/complete/WatcherTest
-```
-
-If the log shows a library change, real-time monitoring works end to end. If not,
-lean on the scheduled scan — everything else still functions.
-
-### Hardware transcoding
-
-Your RTX 3070 Ti works in the container — verified with a real encode
-(`h264_nvenc`, not just a compiled-in codec list), and `nvidia-smi` sees the GPU
-from inside Jellyfin. The compose file already passes the GPU through.
-
-**This is not automatic** — passing the GPU into the container and *using* it are
-two different things. Turn it on under **Dashboard → Playback → Transcoding**:
-
-- Hardware acceleration: **NVIDIA NVENC**
-- Tick **H264**, **HEVC**, **HEVC 10bit**, **VP9**
-- Tick **Enable hardware decoding** and **Enable hardware encoding**
-- Tick **Enable Tone mapping** — DV/HDR10+ content looks washed out on SDR
-  screens without it
-
-Save. Without this, transcoding falls back to CPU — the i9-12900H copes, but 4K
-HDR will make it work hard.
-
-If you ever move this stack to a machine without an NVIDIA GPU, delete the
-`deploy:` block from the jellyfin service or the container will not start.
+That is `EXDEV` — Linux refuses `rename(2)` and hardlinks across mount points,
+**even when both are on the same physical drive**. The apps then fall back to
+copying: every import takes minutes, needs double the disk, and you must choose
+between seeding and having a library.
+
+The identical `/data` path in every container matters too. Sonarr tells
+qBittorrent "the download is at `/data/torrents/complete/x`" — if qBittorrent
+knew that folder by a different path, Sonarr would never find the finished file.
 
 ## Security: what is exposed to whom
 
-| Service | Bound to | Reachable from | Auth |
-| --- | --- | --- | --- |
-| qBittorrent WebUI | `127.0.0.1:8090` | This PC only | Password |
-| gluetun control API | `127.0.0.1:8010` | This PC only | API key |
-| Jellyfin | `0.0.0.0:8096` | LAN + tailnet | Password |
+| Service                         | Bound to                    | Reachable from  | Auth               |
+| ------------------------------- | --------------------------- | --------------- | ------------------ |
+| Jellyfin                        | `0.0.0.0:8096`            | LAN (+ tailnet) | Password           |
+| Sonarr, Radarr, Bazarr, SABnzbd | `127.0.0.1`               | This PC only    | Password / API key |
+| qBittorrent, Prowlarr           | `127.0.0.1` (via gluetun) | This PC only    | Password / API key |
+| gluetun control API             | `127.0.0.1:8010`          | This PC only    | API key            |
 
 A Docker `ports:` entry without an address prefix binds to `0.0.0.0` — every
-interface, so every device on your Wi-Fi. Prefixing it with `127.0.0.1:` limits
-it to this machine. That is the single cheapest hardening step available here and
-it costs nothing when you only use a service locally.
+interface, so every device on your network. Prefixing with `127.0.0.1:` limits
+it to the host. That is the cheapest hardening available and costs nothing for
+services you only use locally.
 
 ### How `gluetun-auth.toml` works
 
-gluetun reads it **once at startup** from `/gluetun/auth/config.toml`, bind-mounted
-read-only by the compose file. Each `[[roles]]` block is an allow-rule:
+gluetun reads it **once at startup** from `/gluetun/auth/config.toml`. Each
+`[[roles]]` block is an allow-rule:
 
 ```toml
 [[roles]]
@@ -519,472 +850,490 @@ apikey = "..."                                          # sent as X-API-Key head
 Three things worth knowing:
 
 1. **Supplying this file replaces gluetun's built-in defaults entirely.** Any
-   route not named in a role is denied — that default-deny is why
-   `GET /v1/openvpn/settings` returns 401 even *with* a valid key.
-2. **Roles are additive.** A route is reachable if any role lists it. Splitting
-   "healthcheck" and "toggle" into two blocks is not required by gluetun — it
-   documents intent and lets you revoke the VPN-stopping capability by deleting
-   one block.
-3. **Changes need a recreate, not a restart** — gluetun only parses the file at
-   startup, and a bind-mounted file change alone does not trigger one:
+   route not named in a role is denied. Without it, `GET /v1/vpn/status` and
+   `GET /v1/publicip/ip` answer *anyone on your LAN* with no credential — and
+   the API is not read-only: `PUT /v1/vpn/status` can **stop your VPN**.
+2. **Roles are additive.** Splitting "healthcheck" and "toggle" into two blocks
+   is not required — it documents intent and lets you revoke the VPN-stopping
+   capability by deleting one block.
+3. **Changes need a recreate, not a restart:**
 
    ```
    docker compose up -d --force-recreate gluetun
-   docker compose up -d --force-recreate qbittorrent
+   docker compose up -d --force-recreate qbittorrent prowlarr
    ```
 
-   (The second is mandatory — see [the namespace
-   note](#why-gluetun-always-needs-docker-compose-restart-qbittorrent-after-it).)
-
-### Can the key live in `.env` instead, so this file can be committed?
-
-Short answer: **no, and you do not need it to.**
+### Why the key cannot live in `.env`
 
 gluetun does **not** support environment-variable interpolation inside
-`config.toml` — the value must be written literally. There is one alternative,
-`HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE`, which takes a JSON role as an env var
-and *could* carry the key from `.env`:
+`config.toml`. There is one alternative,
+`HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE`, which takes a JSON role as an env var —
+but it applies to **every route not covered by a config file**, handing the same
+key access to the routes that stop your VPN and read your settings. That trades
+away least-privilege for tidiness.
 
-```yaml
-- HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE={"name":"default","auth":"apikey","apikey":"${GLUETUN_API_KEY}"}
-```
+The pattern that actually solves "I want to commit this" is the one `.env`
+already uses: commit a template, ignore the real file.
 
-But it sets the role for **every route not covered by a config file** — so used
-on its own it hands the same key access to *all* routes, including the ones that
-stop your VPN, read your OpenVPN credentials-adjacent settings, and change port
-forwarding. That trades away the least-privilege split for tidiness. Not worth it.
-
-**The pattern that actually solves "I want to commit this" is the same one
-already used for `.env`:** keep the secret file untracked, commit a template.
-
-| Committed | Ignored |
-| --- | --- |
+| Committed                     | Ignored               |
+| ----------------------------- | --------------------- |
+| `.env.example`              | `.env`              |
 | `gluetun-auth.toml.example` | `gluetun-auth.toml` |
-| `.env.example` | `.env` |
 
-`.gitignore` already lists both secrets. A fresh clone copies each `.example`,
-generates its own key, and is running — with nothing sensitive ever in history.
-
-> If you later `git init` here, check `git status` **before** the first commit and
-> confirm neither `.env` nor `gluetun-auth.toml` appears. Once a secret is
-> committed, deleting it in a later commit does not remove it from history.
-
-### gluetun control API authentication
-
-Before [gluetun-auth.toml](gluetun-auth.toml) existed, these answered anyone on
-the LAN with no credential at all — verified directly:
-
-```
-GET /v1/publicip/ip   -> 200 {"public_ip": "..."}   # no auth
-GET /v1/vpn/status    -> 200 {"status":"running"}   # no auth
-```
-
-The API is not read-only: `PUT /v1/vpn/status` can **stop your VPN**, and other
-routes expose OpenVPN settings and port-forwarding config. Supplying a
-`config.toml` **replaces** gluetun's built-in defaults, so anything not listed in
-a role is denied outright. Current state:
-
-| Request | Result |
-| --- | --- |
-| `GET /v1/publicip/ip` without key | 401 |
-| `GET /v1/vpn/status` without key | 401 |
-| Either, with `X-API-Key` | 200 |
-| `GET /v1/openvpn/settings` even with key | 401 — not in any role |
-
-`check-vpn.ps1` reads the key straight out of the toml, so rotate it in one place:
-
-```
-docker run --rm qmcgaw/gluetun:v3 genkey
-```
-
-**`gluetun-auth.toml` contains a secret.** Do not commit or sync it.
-
-## Remote access to Jellyfin
-
-### Why the "allow remote connections" checkbox is not enough on its own
-
-`EnableRemoteAccess` only tells Jellyfin *"accept clients from outside my local
-subnet."* It does **not** open a port on your router, give you a public address,
-or add encryption. On its own, nothing changes from the internet's point of view.
-
-The setting that *would* punch a hole is **"Enable automatic port mapping"**
-(UPnP), unticked during setup on purpose. Checkbox + UPnP is how people
-accidentally publish a plaintext-HTTP Jellyfin login to the open internet.
-Jellyfin has had authentication CVEs; this is not a thing to leave exposed.
-
-The checkbox **is** required for Tailscale, though — tailnet clients get
-`100.64.0.0/10` addresses, which Jellyfin considers non-local and would reject.
-So it is enabled, and the safety comes from Tailscale rather than from Jellyfin
-refusing connections.
-
-### Tailscale setup
-
-> **Status: not installed.** The server side is ready — Jellyfin's
-> `EnableRemoteAccess` is on and `100.64.0.0/10` is registered as a local
-> network, so this works the moment you install the client. Nothing below has
-> been done yet; pick it up whenever you want remote access.
-
-Tailscale builds an encrypted private mesh between your own devices. **No router
-ports are opened and nothing is exposed to the public internet** — devices
-authenticate to your account and talk directly.
-
-1. Create a free account at <https://tailscale.com> (free tier covers 100 devices)
-2. Install the Windows client on this PC from
-   <https://tailscale.com/download/windows>, sign in
-3. Install Tailscale on each device you want to watch from — phone, laptop,
-   Android TV — and sign in to the **same account**
-4. Find this machine's tailnet address: `tailscale ip -4` (a `100.x.y.z` address)
-5. Watch from any signed-in device at `http://100.x.y.z:8096`
-
-With **MagicDNS** on (Tailscale admin console) you can use the machine name
-instead: `http://your-pc-name:8096`.
-
-### Real HTTPS, free, without a domain
-
-`tailscale serve` fronts Jellyfin with a **browser-trusted Let's Encrypt
-certificate** on a `*.ts.net` hostname — no domain purchase, no port forwarding,
-no certificate warnings:
-
-```
-tailscale serve --bg 8096
-```
-
-Gives you `https://your-pc-name.your-tailnet.ts.net`, reachable only by devices
-on your tailnet. This is the tidiest answer to "I want HTTPS and remote access"
-for a home setup.
-
-> Do **not** use `tailscale funnel` unless you mean it — that deliberately
-> publishes the service to the entire internet, which is exactly what we avoided.
-
-### Caveats
-
-- This is a **laptop**. Remote access works only while it is awake and online.
-  Check Windows sleep settings if streams cut out.
-- qBittorrent is bound to `127.0.0.1`, so it is **not** reachable over the tailnet
-  either. To change that, drop the `127.0.0.1:` prefix from its `ports:` entry —
-  and add HTTPS before you do, since the login would otherwise cross the network
-  in plaintext.
+> Before your first `git commit`, run `git status` and confirm neither `.env`
+> nor `gluetun-auth.toml` appears. Once a secret is in history, deleting it in a
+> later commit does not remove it.
 
 ## Turning the VPN on and off
 
-Three different things people mean by this. Only two of them are settings.
+Three different things people mean by this.
 
-### 1. Pause / resume the tunnel — `vpn-toggle.ps1`
+### 1. Pause / resume the tunnel — `scripts\vpn-toggle.ps1` / `scripts/vpn-toggle.sh`
 
+```powershell
+.\scripts\vpn-toggle.ps1            # toggle
+.\scripts\vpn-toggle.ps1 status     # show state + exit IP
+.\scripts\vpn-toggle.ps1 stop
+.\scripts\vpn-toggle.ps1 start      # reconnects, then verifies your real IP is not exposed
 ```
-.\vpn-toggle.ps1            # toggle
-.\vpn-toggle.ps1 status     # show state + exit IP
-.\vpn-toggle.ps1 stop
-.\vpn-toggle.ps1 start      # reconnects, then verifies your real IP is not exposed
+
+```bash
+./scripts/vpn-toggle.sh             # toggle
+./scripts/vpn-toggle.sh status
+./scripts/vpn-toggle.sh stop
+./scripts/vpn-toggle.sh start
 ```
 
 **This is a pause button, not a bypass.** Stopping the tunnel does *not* give
-qBittorrent a direct connection — gluetun's firewall stays up, so qBittorrent
-loses all connectivity. Verified directly:
+qBittorrent a direct connection — gluetun's firewall stays up, so it loses all
+connectivity. Verified:
 
 ```
 PUT /v1/vpn/status {"status":"stopped"}  ->  {"outcome":"stopped"}
 curl from inside qbittorrent             ->  no response at all
 ```
 
-That is the kill switch doing its job. Use this when you want torrent traffic to
-stop *now* without tearing the stack down, or to force a reconnect to a different
-Privado server.
+Downloads go to 0 B/s, not to full speed. Use it to stop torrent traffic
+immediately, or to force a reconnect to a different server.
 
-It needs the `PUT /v1/vpn/status` role in `gluetun-auth.toml`. That route is
-localhost-only and API-key protected — but it is the one route that can disable
-your VPN, so do not widen its exposure.
+It does **not** need a container restart afterwards — it pauses the tunnel
+inside the running container, so the network namespace is never destroyed.
 
-### 2. Change country / exit server — a setting
+### 2. Change exit country — a setting
 
 In `.env`:
 
 ```
-PRIVADO_COUNTRIES=Netherlands
+VPN_COUNTRIES=Netherlands
 ```
 
-Then `docker compose up -d && docker compose restart qbittorrent`.
-See the available list with:
+Then `docker compose up -d && docker compose restart qbittorrent prowlarr`.
+See available countries with:
 
 ```
 docker run --rm qmcgaw/gluetun:v3 format-servers -privado
 ```
 
-gluetun picks a random server within the country each time it connects, which is
-why the exit IP changes between reconnects.
+gluetun picks a random server within the country on each connect, which is why
+the exit IP changes between reconnects.
 
-### 3. Running qBittorrent with no VPN — `docker-compose.novpn.yml`
+### 3. Running the whole stack with no VPN
 
-Built as a **separate instance**, never a mode of the protected one, so the main
-stack cannot accidentally end up unprotected.
-
-```
-docker compose -f docker-compose.novpn.yml up -d     # start
-docker compose -f docker-compose.novpn.yml down      # stop -- do this when done
-```
-
-WebUI: <http://localhost:8091> (localhost only).
-
-⚠ **Any torrent added here puts your real IP into the swarm** — visible to every
-peer, and to anyone monitoring it, which on public trackers includes
-copyright-enforcement firms who collect IPs exactly this way. There is no kill
-switch; that is the entire point of the file, and why it is separate.
-
-What keeps it from contaminating the protected setup — verified while both ran
-side by side:
-
-| | Protected | No-VPN |
-| --- | --- | --- |
-| Project | `downloader` | `downloader-novpn` |
-| Container | `qbittorrent` | `qbittorrent-novpn` |
-| WebUI port | 8090 | 8091 |
-| Config volume | `downloader_qbittorrent-config` | `downloader-novpn_qbittorrent-novpn-config` |
-| Downloads | `D:\Torrents` | `D:\Torrents-novpn` |
-| Exit IP observed | `91.148.240.149` (Privado) | `143.179.55.141` (yours) |
-| `restart:` | `unless-stopped` | **`no`** — never survives a reboot |
-
-Two safety features worth knowing:
-
-- It **cannot start by accident** — the explicit `-f docker-compose.novpn.yml` is
-  required, and `restart: "no"` means it never comes back on its own.
-- `check-vpn.ps1` **prints a red warning** if it finds this instance running, so a
-  forgotten benchmark session gets caught the next time you check the VPN.
-
-For measuring raw throughput you do not need this at all — `speedtest.ps1`
-answers that without touching a swarm. Use this only to observe qBittorrent's own
-behaviour (peer counts, stall patterns, swarm connectivity) without the tunnel,
-and prefer a torrent nobody objects to you having: a well-seeded official Linux
-distro ISO is both the safe choice and the better benchmark.
-
-#### First run: fix the save path before adding anything
-
-A fresh config volume ships with qBittorrent's factory-default save path,
-`/downloads` — a path that does not exist in this container; only `/data` is
-mounted. Adding a torrent before fixing this fails with `Permission denied` file
-errors, because qBittorrent (as UID 1000) cannot create `/downloads` at the
-container root.
-
-Fix once — it persists in the volume from then on:
+Full setup: [ONE-TIME-SETUP.md](ONE-TIME-SETUP.md#optional-running-the-whole-stack-without-a-vpn).
+`docker-compose.novpn.yml` is an **alternative** to the protected stack, not a
+second instance alongside it — same project, same container names, same
+ports, same volumes, minus gluetun:
 
 ```
-docker compose -f docker-compose.novpn.yml stop qbittorrent-novpn
-docker run --rm -v downloader-novpn_qbittorrent-novpn-config:/config alpine sh -c "sed -i 's|=/downloads/incomplete/|=/data/incomplete/|g; s|=/downloads/|=/data/complete/|g' /config/qBittorrent/qBittorrent.conf"
-docker compose -f docker-compose.novpn.yml up -d
+docker compose down                                   # stop the protected stack
+docker compose -f docker-compose.novpn.yml up -d      # start the no-VPN one
 ```
 
-Or set it by hand in the WebUI first: *Options → Downloads* → save to
-`/data/complete`, incomplete to `/data/incomplete`.
-
-#### The torrenting port and why it matters here specifically
-
-Unlike the WebUI port, `6882` is published on **all interfaces**
-(`ports: - 6882:6882/tcp` and `/udp`), not `127.0.0.1`. This is the one thing
-Privado can never offer this stack: a real chance at incoming peer connections.
-
-Two things to know:
-
-- **Docker publishing it is necessary but not sufficient.** Your router also
-  needs to forward `6882` (TCP+UDP) to this PC before it works from the open
-  internet. Without that router step, this instance is exactly as
-  inbound-blocked as the protected one — just for a different reason (ISP NAT,
-  not Privado's policy) — and a speed comparison between them will not show the
-  benefit port forwarding is supposed to provide.
-- **If you don't do the router step, don't expect this instance to be faster.**
-  A missing router forward was exactly why an early speed test here looked
-  identical to the VPN instance — this container could send outbound requests
-  to peers but nothing could connect back in.
-
-#### Picking a torrent to test with
-
-A torrent with almost no swarm will be slow **everywhere**, VPN or not — that
-is not a VPN comparison, it is a "this torrent is dead" result. Verified case:
-a torrent with `num_seeds: 1` measured at ~1.7 Mbps on this no-VPN instance,
-which tells you nothing about the stack. Use `torrents/info` (or the WebUI's
-Seeds/Peers columns) to check seed count before drawing any conclusion, and
-prefer a well-seeded official Linux ISO for an actual comparison.
-
-## Verify the VPN before downloading
+⚠ **qBittorrent and Prowlarr both connect directly to the internet in this
+mode** — every peer in a torrent swarm sees your real IP, and every indexer
+search reveals which sites you query to your ISP. There is no kill switch;
+that is the point of the file. Switch back the moment you're done:
 
 ```
-powershell -ExecutionPolicy Bypass -File C:\docker\downloader\check-vpn.ps1
+docker compose -f docker-compose.novpn.yml down
+docker compose up -d
 ```
 
-It prints your real IP, the IP the container actually uses, and then stops gluetun
-to confirm qBittorrent really loses connectivity. All three must look right.
+Because container names and ports are identical to the protected stack, both
+files can never run at once — starting one while the other's containers exist
+fails outright on a naming conflict, rather than silently running both.
 
-For an end-to-end check, use the magnet link at <https://ipleak.net> ("Torrent
-Address detection") — add it in qBittorrent and the page should show the Privado
-IP, not yours.
+For raw throughput you do not need it — `scripts\speedtest.ps1` / `scripts/speedtest.sh`
+measures that without touching a swarm.
 
-## Troubleshooting
+## What the VPN costs you
 
-| Symptom | Fix |
-| --- | --- |
-| `Unauthorized` in the WebUI when using a hostname/LAN IP | Options -> Web UI -> uncheck *Enable Host header validation* (localhost works by default) |
-| gluetun `AUTH_FAILED` | Use the OpenVPN username from <https://app.privadovpn.com/admin-panel>, not your email; then try `OPENVPN_PROTOCOL=tcp` |
-| qBittorrent never starts | gluetun isn't healthy — `docker logs gluetun` |
-| Slow / stalled torrents | Expected without port forwarding; prefer well-seeded torrents |
-| Ran out of data | Privado's free tier caps at 10 GB/month |
-| Jellyfin shows nothing after a download | Dashboard -> Scheduled Tasks -> *Scan Media Library* -> run manually. If that finds it, real-time monitoring missed the event |
-| Jellyfin logs write/permission errors on scan | Untick *Save artwork into media folders* and *Save metadata as NFO* — `/media` is read-only by design |
-| Jellyfin container won't start | Almost always the GPU `deploy:` block on a machine without NVIDIA — remove it |
-| Jellyfin can't identify a movie | Rename the folder to `Movie Name (Year)`, or use *Identify* on the item |
-| 4K HDR looks washed out | Tick *Enable Tone mapping* under Dashboard -> Playback -> Transcoding |
-| Forgot the Jellyfin admin password | No temporary-password fallback like qBittorrent — recovery means editing the database. Worst case: `docker volume rm qbittorrent_jellyfin-config` and redo the wizard (loses watch history, not media) |
-| Playback stutters on 4K | Enable NVENC under Dashboard -> Playback, or use a client that direct-plays HEVC |
-| A torrent shows "missing files" after the mount change | Right-click it -> *Set Location* -> `/data/complete` |
-| **Can't log in to qBittorrent any more** | The temporary password is regenerated on **every restart**. Get the current one with `docker logs qbittorrent \| Select-String "temporary password" \| Select-Object -Last 1`, then set a permanent one — see below |
-| WebUI unreachable after changing a port | The `ports:` pair and `WEBUI_PORT` disagree, or the entry was put on `qbittorrent` instead of `gluetun`. See *Changing the ports* |
-| qBittorrent WebUI refused from another device | Intended — it is bound to `127.0.0.1`. Use this PC, or drop the prefix in `ports:` |
-| `check-vpn.ps1` step 4 says "key rejected" | The key in `gluetun-auth.toml` and the one gluetun loaded differ — `docker compose up -d` after editing the file |
-| Control API returns 401 from a script | Send the key as an `X-API-Key` header; only `GET /v1/publicip/ip` and `GET /v1/vpn/status` are permitted |
-| `check-vpn.ps1` reports an odd city | GeoIP databases are inaccurate on Privado's ranges (the same block has reported Medemblik, Lelystad and Copenhagen). Judge by *the IP differing from yours*, not by the city |
-| Jellyfin unreachable over Tailscale | Confirm `EnableRemoteAccess` is true and `100.64.0.0/10` is in *LAN Networks* (Dashboard -> Networking) |
-| No-VPN instance: torrent errors with "Permission denied" on every file | Fresh config volume still has the factory default save path `/downloads`, which is not mounted. See *First run: fix the save path* under the no-VPN section |
-| WebUI dead, but both containers show `Up` | You restarted gluetun on its own — run `docker compose restart qbittorrent`. See *Why gluetun always needs...* below |
-
-### Recovery: bad setting in the WebUI
-
-The config lives in a Docker named volume, so it is not editable from Explorer.
-To undo a `Network interface` setting that broke connectivity:
-
-```
-docker exec qbittorrent sed -i 's/^Session\\Interface=.*//' /config/qBittorrent/qBittorrent.conf
-docker compose restart qbittorrent
+```powershell
+.\scripts\speedtest.ps1                 # 25 MB per path
+.\scripts\speedtest.ps1 -SizeMB 100     # firmer numbers, more data used
 ```
 
-## Renaming or moving this folder
-
-Safe now, but it was not always. Compose derives the **project name** from the
-folder name unless told otherwise, and the project name prefixes every named
-volume:
-
-```
-folder "qbittorrent"  ->  volume qbittorrent_qbittorrent-config
-folder "downloader"   ->  volume downloader_qbittorrent-config
+```bash
+./scripts/speedtest.sh                  # 25 MB per path
+./scripts/speedtest.sh 100               # firmer numbers, more data used
 ```
 
-Rename the folder without pinning the project, and `docker compose up -d` looks
-for a volume that does not exist, **creates an empty one, and starts a blank
-qBittorrent** — torrents, settings and password gone. No error, no warning. The
-fixed `container_name:` values turn it into a name-conflict error instead, which
-is the only reason it fails loudly rather than silently.
+Example measurement (50 MB × 2, best of each) on a 700 Mbps line, through
+Privado over OpenVPN — your numbers depend on your provider and connection:
 
-This is now prevented by the first line of `docker-compose.yml`:
+| Path                          | Speed                |
+| ----------------------------- | -------------------- |
+| Direct (no VPN)               | ~81 MB/s — 649 Mbps |
+| Through the VPN (OpenVPN/UDP) | ~21 MB/s — 167 Mbps |
+| Tunnel overhead               | ~74%                 |
 
-```yaml
-name: downloader
+That overhead is normal for **OpenVPN**: single-threaded, encryption in
+userspace. **WireGuard loses far less** (often single-digit percent) — if your
+provider supports it, switching `VPN_TYPE` to `wireguard` in `.env` (see
+[Using a different VPN provider](#using-a-different-vpn-provider)) is the real
+fix, not a setting to tune within OpenVPN.
+
+**It rarely matters either way.** Torrent speed is governed by seeder count and
+the absence of port forwarding far more than by this ceiling. A torrent with 1
+seeder is slow everywhere — check the Seeds column before blaming the tunnel.
+
+> Only the tunnelled runs consume your VPN data allowance, if your provider caps
+> one (Privado's free tier is 10 GB/month). A `-SizeMB 100 -Runs 2` test spends
+> 200 MB of it.
+
+## Remote access to Jellyfin
+
+### The "allow remote connections" checkbox is not enough
+
+`EnableRemoteAccess` only tells Jellyfin *"accept clients from outside my local
+subnet."* It does **not** open a router port, give you a public address, or add
+encryption.
+
+The setting that *would* punch a hole is **"Enable automatic port mapping"**
+(UPnP), which is why setup step 12 unticks it. Checkbox + UPnP is how people
+accidentally publish a plaintext-HTTP Jellyfin login to the open internet.
+Jellyfin has had authentication CVEs; this is not a thing to leave exposed.
+
+The checkbox **is** required for Tailscale, though — tailnet clients get
+`100.64.0.0/10` addresses, which Jellyfin treats as non-local and would reject.
+
+### Tailscale — the recommended way
+
+An encrypted private mesh between your own devices. **No router ports opened,
+nothing exposed to the public internet.**
+
+1. Create a free account at [https://tailscale.com](https://tailscale.com)
+2. Install the client on this PC and sign in
+3. Install it on every device you want to watch from — same account
+4. Find this machine's address: `tailscale ip -4` (a `100.x.y.z`)
+5. Browse to `http://100.x.y.z:8096`
+
+For Jellyfin to accept those clients, add `100.64.0.0/10` to
+**Dashboard → Networking → LAN Networks**.
+
+With **MagicDNS** on you can use the machine name instead of the IP.
+
+### Free HTTPS with a real certificate
+
+`tailscale serve` fronts Jellyfin with a browser-trusted Let's Encrypt
+certificate on a `*.ts.net` hostname — no domain purchase, no port forwarding,
+no certificate warnings:
+
+```
+tailscale serve --bg 8096
 ```
 
-With the project pinned, the folder name is irrelevant. Move or rename it freely.
+> Do **not** use `tailscale funnel` unless you mean it — that publishes the
+> service to the entire internet, which is exactly what this avoids.
 
-### If you ever do need to migrate volumes between project names
+## Hardware transcoding
 
-Copy, never move, so the originals remain as a rollback:
+Passing the GPU into the container and *using* it are two different things. The
+compose file does the first; you must do the second.
 
-```
-docker stop qbittorrent jellyfin gluetun
-docker rm   qbittorrent jellyfin gluetun     # containers only -- volumes survive
-docker volume create newproject_qbittorrent-config
-docker run --rm -v oldproject_qbittorrent-config:/from -v newproject_qbittorrent-config:/to alpine sh -c "cd /from && cp -a . /to/"
-```
+**Dashboard → Playback → Transcoding:**
 
-Verify by file count and size before deleting anything:
+- Hardware acceleration: **NVIDIA NVENC**
+- Tick **H264**, **HEVC**, **HEVC 10bit**, **VP9**
+- Tick **Enable hardware decoding** and **Enable hardware encoding**
+- Tick **Enable Tone mapping** — HDR/DV content looks washed out on SDR screens
+  without it
 
-```
-docker run --rm -v oldproject_qbittorrent-config:/v alpine find /v -type f | Measure-Object
-```
-
-## Daily use
+Verify the GPU is actually visible to the container:
 
 ```
-docker compose up -d      # start
-docker compose down       # stop
-docker compose pull; docker compose up -d    # update
+docker exec jellyfin nvidia-smi --query-gpu=name --format=csv,noheader
 ```
 
-### Why gluetun always needs `docker compose restart qbittorrent` after it
+No NVIDIA GPU? Delete the `deploy:` block from the `jellyfin` service or the
+container will not start.
+
+## Running on Linux
+
+Two changes:
+
+1. In `.env`, set `MEDIA_ROOT=/srv/media` (or wherever), using a normal path.
+2. Set `PUID`/`PGID` in `docker-compose.yml` to your user — `id -u` and `id -g`.
+   On Windows these are ignored because drvfs has no real ownership; on Linux
+   they decide whether the apps can write to your media folders at all.
+
+Everything else works the same way, including every helper script — each
+`.ps1` has a `.sh` twin with identical behavior (`scripts/check-vpn.sh`,
+`scripts/vpn-toggle.sh`, `scripts/speedtest.sh`). The Windows Firewall step (step 15,
+[Let your phone reach Jellyfin](#15-let-your-phone-reach-jellyfin)) does not
+apply; use `ufw allow 8096/tcp` or your distro's equivalent instead.
+
+## Using a different VPN provider
+
+This repo ships pre-configured for Privado, but **gluetun itself is
+provider-agnostic** — around 40 providers are supported, and switching is
+purely an `.env` edit. Nothing in `docker-compose.yml`, nor any other
+container, needs to change or even knows which VPN you're using.
+
+Full provider list, with the exact variables each one needs:
+[gluetun-wiki/setup/providers](https://github.com/qdm12/gluetun-wiki/tree/main/setup/providers).
+
+### The two connection types
+
+Every provider uses one of these. `.env.example` has a ready-to-fill template
+for both.
+
+**OpenVPN** (username + password) — what Privado uses, and the simpler of the
+two to set up. Most providers support it.
+
+```ini
+VPN_SERVICE_PROVIDER=protonvpn      # your provider's gluetun name, lowercase
+VPN_TYPE=openvpn
+OPENVPN_USER=your-openvpn-username  # NOT your website login -- see below
+OPENVPN_PASSWORD=your-openvpn-password
+```
+
+**WireGuard** (key-based, no username/password) — meaningfully faster, since
+OpenVPN's encryption is single-threaded and WireGuard's isn't (see
+[What the VPN costs you](#what-the-vpn-costs-you)). Get the values from your
+provider's WireGuard config generator, usually a downloadable file.
+
+```ini
+VPN_SERVICE_PROVIDER=protonvpn
+VPN_TYPE=wireguard
+WIREGUARD_PRIVATE_KEY=your-private-key
+WIREGUARD_ADDRESSES=10.x.x.x/32
+```
+
+⚠ Whichever type you use, the credentials are almost never your provider's
+**website login**. Nearly every provider issues a *separate* OpenVPN/WireGuard
+credential on a "manual setup" page in your account dashboard. Using your
+website email as `OPENVPN_USER` is the single most common cause of
+`AUTH_FAILED` — this isn't a Privado quirk, it trips people up on every
+provider.
+
+### Worth knowing when choosing a provider
+
+**Port forwarding matters more than raw speed.** Privado has none, on any
+plan — downloads work fine, but no peer can connect *to* you, so seeding is
+weak and poorly-seeded torrents stay slow regardless of your connection speed
+(see [Adding media](#adding-media-you-do-not-add-things-one-at-a-time) — this
+is why per-episode releases often beat season packs). Providers with port
+forwarding (Proton, AirVPN, PIA) fix that directly.
+
+**WireGuard support** — most providers with port forwarding also support
+WireGuard, and the two tend to go together. If both matter to you, that
+narrows the field fast.
+
+---
+
+# TROUBLESHOOTING
+
+## The stack
+
+| Symptom                                             | Fix                                                                                                                                 |
+| --------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| gluetun`AUTH_FAILED`                              | Use the OpenVPN username from your provider's admin panel,**not** your email. Then try `OPENVPN_PROTOCOL=tcp`               |
+| qBittorrent/Prowlarr never start                    | gluetun is not healthy —`docker logs gluetun`                                                                                    |
+| WebUI dead but containers show`Up`                | You restarted gluetun alone. Run`docker compose restart qbittorrent prowlarr`                                                     |
+| `joining network namespace ... No such container` | After`--force-recreate` on gluetun, `restart` is not enough. Use `docker compose up -d --force-recreate qbittorrent prowlarr` |
+| Compose says a variable is not set                  | `.env` is missing or lacks `MEDIA_ROOT`. Copy `.env.example`                                                                  |
+| A service can't write to`/data`                   | On Linux,`PUID`/`PGID` don't match the folder owner                                                                             |
+
+## Downloads
+
+| Symptom                             | Fix                                                                                                                                                                           |
+| ----------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Torrent stuck at "stalled"          | Check the**Seeds** column. 1 seeder is slow everywhere — not a VPN problem                                                                                             |
+| Torrent errors after moving folders | Right-click →**Set Location** → the new path, then **Force Recheck**. Set Location alone does not re-verify                                                     |
+| "Permission denied" on every file   | Save path points somewhere not mounted. It must be under`/data`                                                                                                             |
+| Can't log in to qBittorrent         | The temp password regenerates on**every restart**: `docker logs qbittorrent \| Select-String "temporary password" \| Select-Object -Last 1` — then set a permanent one |
+| Slow torrents generally             | Expected without port forwarding; prefer well-seeded releases                                                                                                                 |
+| Ran out of VPN data                 | Only if your provider caps one — Privado's free tier is 10 GB/month                                                                                                          |
+
+## The *arr apps
+
+| Symptom                                                          | Fix                                                                                               |
+| ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| Prowlarr can't reach Sonarr/Radarr                               | Use container names`sonarr`/`radarr`, not `localhost` — Prowlarr is in gluetun's namespace |
+| Sonarr/Radarr can't reach qBittorrent                            | Host is`gluetun`, port `8090` — not `localhost`                                            |
+| `ProwlarrUrl: Invalid Url` when adding Sonarr/Radarr as an app | Prowlarr Server field must be`http://gluetun:9696`, not `localhost` — see step 8             |
+| `blocked by CloudFlare Protection` on an indexer               | The site is refusing automated access. Use an indexer you have proper access to instead           |
+| `Category does not exist` adding SABnzbd as a download client  | The category must exist in SABnzbd first — see step 9                                            |
+| SABnzbd download client fails with`401`/`Access denied`      | Add`sabnzbd` to SABnzbd's Host whitelist — see step 9                                          |
+| Imports are slow / disk fills up                                 | Hardlinks are failing. Confirm downloads and library are under the same`MEDIA_ROOT`             |
+| Nothing is found for anything                                    | No indexers configured, or they didn't sync. Prowlarr →**Sync App Indexers**               |
+
+## Jellyfin
+
+| Symptom                                       | Fix                                                                                                                                                           |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Shows several servers and none work** | See[below](#jellyfin-shows-several-servers-and-none-work)                                                                                                      |
+| Library is empty                              | Files only appear after Sonarr/Radarr*import* them into `/data/library`. Raw downloads are not in the library                                             |
+| Nothing appears after a download              | **Dashboard → Scheduled Tasks → Scan Media Library**. If that finds it, real-time monitoring missed the event                                         |
+| Write/permission errors on scan               | Untick*Save artwork into media folders* and *Save metadata as NFO* — `/media` is read-only by design                                                   |
+| Container won't start                         | Almost always the GPU`deploy:` block on a machine without NVIDIA                                                                                            |
+| Can't identify a movie                        | Rename the folder to`Movie Name (Year)`, or use *Identify*                                                                                                |
+| 4K HDR looks washed out                       | Tick*Enable Tone mapping* under Dashboard → Playback                                                                                                       |
+| Playback stutters on 4K                       | Enable NVENC, or use a client that direct-plays HEVC                                                                                                          |
+| Forgot the admin password                     | No fallback — recovery means editing the database, or`docker volume rm downloader_jellyfin-config` and redoing the wizard (loses watch history, not media) |
+
+### Jellyfin shows several servers and none work
+
+Two separate causes, usually together.
+
+**1. No firewall rule.** Docker publishes 8096, but Windows blocks inbound
+connections unless something allows them, and Docker Desktop does not create the
+exception. This blocks *every* address. Fix — elevated PowerShell:
 
 ```
-docker restart gluetun                 # <- never do this on its own
-docker compose restart qbittorrent     # <- always follow with this
+New-NetFirewallRule -DisplayName "Jellyfin (8096)" -Direction Inbound -Protocol TCP -LocalPort 8096 -Action Allow -Profile Private
 ```
 
-qBittorrent has no network stack of its own. `network_mode: service:gluetun`
-means it is *joined to gluetun's* network namespace — same interfaces, same IP,
-same routing table. That is exactly what makes the kill switch airtight, and it
-is also the catch.
+**2. Virtual adapters.** Jellyfin's auto-discovery answers on every network
+interface, and a Docker host has many. Only addresses on your real LAN work:
 
-A network namespace belongs to the process that created it. When gluetun stops,
-Docker tears its namespace down. When gluetun starts again it creates a **brand
-new** namespace — it does not reclaim the old one. qBittorrent is still pointed
-at the old, now-dead namespace, and nothing re-attaches it automatically: it ends
-up with no working interface at all. The container looks `Up` in `docker ps`, but
-the WebUI is unreachable and no torrent moves.
+| Example address    | What it is                       | Usable? |
+| ------------------ | -------------------------------- | ------- |
+| `192.168.x.x`    | Real LAN (WiFi or Ethernet)      | ✅      |
+| `172.x.x.x`      | WSL / Docker internal            | ❌      |
+| `169.254.x.x`    | Link-local (no DHCP)             | ❌      |
+| `100.x.x.x`      | Tailscale — works, if installed | ✅      |
+| Other VPN adapters | Different virtual network        | ❌      |
 
-Restarting the qbittorrent container is what makes it join the current namespace.
+A PC on both WiFi *and* Ethernet has two valid LAN IPs; either works. List the
+real ones:
+
+```
+Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.PrefixOrigin -eq 'Dhcp' } | Select-Object IPAddress, InterfaceAlias
+```
+
+**Also check:** if your phone is on a **Guest** WiFi network, it cannot reach
+the main LAN at all regardless of firewall rules — guest networks are
+deliberately isolated.
+
+## Deep dives
+
+### Why gluetun changes need a qBittorrent/Prowlarr restart
+
+```
+docker restart gluetun                        # <- never on its own
+docker compose restart qbittorrent prowlarr   # <- always follow with this
+```
+
+qBittorrent and Prowlarr have no network stack of their own.
+`network_mode: service:gluetun` joins them to gluetun's namespace — same
+interfaces, same IP, same routing table. That is what makes the kill switch
+airtight, and it is also the catch.
+
+A namespace belongs to the process that created it. When gluetun stops, Docker
+tears its namespace down; when it starts again it creates a **brand new** one.
+The dependent containers still point at the old, dead namespace and nothing
+re-attaches them. They look `Up` in `docker ps`, but nothing works.
+
 `depends_on` only controls *startup* ordering — it does nothing on a restart of
 an already-running stack.
 
 Rules of thumb:
 
-- `docker compose restart` / `up -d` / `down` on the **whole stack** — fine, both
-  containers are handled in order.
-- Touching **gluetun alone** (restart, recreate, changing anything in its
-  `environment:`) — always follow with `docker compose restart qbittorrent`.
-- After `--force-recreate` on gluetun, `restart` is **not enough** — it fails with
-  `joining network namespace ... No such container`, because qBittorrent still
-  references the old container ID. Use
-  `docker compose up -d --force-recreate qbittorrent` instead.
-- `vpn-toggle.ps1` does **not** need any of this — it pauses the tunnel inside the
-  running container, so the namespace is never destroyed.
-- Symptom that you forgot: WebUI dead, containers both `Up`, and
-  `docker exec qbittorrent curl -s ifconfig.me` returns nothing.
+- Whole-stack `up -d` / `down` / `restart` — fine, handled in order
+- Touching **gluetun alone** — always restart its dependants
+- After `--force-recreate` on gluetun, `restart` **fails outright** with
+  `No such container`; use `up -d --force-recreate qbittorrent prowlarr`
+- `scripts\vpn-toggle.ps1` needs none of this
 
-`check-vpn.ps1` already does this for you after its kill-switch test.
+### Changing ports
 
-## Does Docker protect me from viruses?
+For services in gluetun's namespace, edit **two** places and keep them in sync:
 
-Partly, and it is worth being precise about which part — the protection is
-narrower than it looks.
+| Port                | Publish on`gluetun`   | Matching setting                                           |
+| ------------------- | ----------------------- | ---------------------------------------------------------- |
+| qBittorrent WebUI   | `127.0.0.1:8090:8090` | `WEBUI_PORT=8090` on **qbittorrent**               |
+| gluetun control API | `127.0.0.1:8010:8010` | `HTTP_CONTROL_SERVER_ADDRESS=:8010` on **gluetun** |
+| Prowlarr            | `127.0.0.1:9696:9696` | Prowlarr's own setting                                     |
 
-**What the container does protect.** If a malicious torrent or peer exploited a
-bug *in qBittorrent itself*, the attacker would land inside the container as an
-unprivileged user, with the VPN as their only network path. They would see
-`/config` and `/data` — not the rest of the PC. That is a real gain over running
-qBittorrent natively on Windows, but it is an uncommon attack.
+The `ports:` entry always goes on **gluetun**, never on the dependent service —
+Docker hard-errors otherwise. And `WEBUI_PORT` is passed as a `--webui-port`
+flag, overriding `qBittorrent.conf`, so do not also change it in the WebUI.
 
-**What it does not protect, which is the actual risk.** The container never opens
-your files. That happens in Windows, after they have been written to
-`D:\Torrents\complete`. A downloaded `.exe`, `.msi` or macro-laden document is
-exactly as dangerous as it would have been without Docker. The container is a box
-around the *downloader*, not around the *downloads*. It is also not a security
-sandbox in the guarantee sense — it is process isolation, which can be escaped,
-just rarely.
+Sonarr, Radarr, Bazarr, SABnzbd and Jellyfin have their own namespaces — change
+their `ports:` directly, nothing to sync.
 
-**The VPN is orthogonal.** It hides what is being downloaded from the ISP. It
-does nothing about what is inside the file.
+The defaults 8080 and 8000 were deliberately vacated: both are heavily contested
+on a dev machine (8080: Tomcat, webpack, Spring Boot; 8000: Django, uvicorn,
+`python -m http.server`). SABnzbd took 8080 since qBittorrent had moved off it.
 
-What actually reduces the risk:
+### Renaming or moving this folder
+
+Safe — because `docker-compose.yml` starts with:
+
+```yaml
+name: downloader
+```
+
+Without that, Compose derives the project name from the **folder name**, and the
+project name prefixes every named volume. Rename the folder and `up -d` looks
+for a volume that does not exist, **creates an empty one, and starts a blank
+app** — settings and history gone, no error. The fixed `container_name:` values
+turn it into a loud name-conflict error instead, which is the only reason it
+fails visibly.
+
+To migrate volumes between project names, copy — never move — so the originals
+remain as a rollback:
+
+```
+docker volume create newproject_sonarr-config
+docker run --rm -v oldproject_sonarr-config:/from -v newproject_sonarr-config:/to alpine sh -c "cd /from && cp -a . /to/"
+```
+
+### Does Docker protect me from viruses?
+
+Partly, and the protection is narrower than it looks.
+
+**What it does protect:** if a malicious torrent or peer exploited a bug *in
+qBittorrent itself*, the attacker would land inside the container as an
+unprivileged user with the VPN as their only network path. They would see
+`/config` and `/data`, not the rest of the PC. A real gain over running the
+client natively — but an uncommon attack.
+
+**What it does not protect, which is the actual risk:** the container never
+opens your files. You do, in Windows, after they land in your library. A
+downloaded `.exe` or macro-laden document is exactly as dangerous as it would
+have been without Docker. The container is a box around the *downloader*, not
+around the *downloads*. It is process isolation, not a security sandbox.
+
+**The VPN is orthogonal** — it hides what you download from your ISP, and does
+nothing about what is inside the file.
+
+What actually reduces risk:
 
 - **Executables are the danger**: `.exe`, `.msi`, `.scr`, `.bat`, `.lnk`,
-  `.iso`/`.img`. Media files (`.mkv`, `.mp3`, `.pdf`) are far lower risk. A movie
-  torrent containing a "player" or "codec installer" is malware.
-- **Password-protected archives are a red flag** — the password exists so scanners
-  cannot look inside.
-- **Watch for double extensions** (`movie.mp4.exe`). Turn on Explorer →
-  View → Show → *File name extensions* so they are visible.
-- **Read the torrent comments** before opening anything; fake uploads usually get
-  called out there.
-- **Let it sit, then rescan.** Defender's signatures update daily, so a scan a day
-  later catches things a same-day scan misses. Right-click → *Scan with Microsoft
-  Defender*.
-- **Keep Defender on and do not exclude `D:\Torrents`.** Check with:
-  `Get-MpComputerStatus | Select RealTimeProtectionEnabled, AntivirusSignatureAge`
-- **Leave "Run external program on torrent completion" empty**
-  (Options → Downloads). It runs inside the container, so the blast radius is
-  limited, but there is no reason to hand a torrent-triggered code path to
-  anything.
+  `.iso`/`.img`. Media files are far lower risk. A movie release containing a
+  "player" or "codec installer" is malware
+- **Password-protected archives are a red flag** — the password exists so
+  scanners cannot look inside
+- **Watch for double extensions** (`movie.mp4.exe`). Enable Explorer →
+  View → Show → *File name extensions*
+- **Read release comments** — fake uploads usually get called out
+- **Let it sit, then rescan.** Antivirus signatures update daily; a scan a day
+  later catches what a same-day scan missed
+- **Do not exclude your media folder from antivirus**
+- **Leave "Run external program on completion" empty** in qBittorrent
 
-For genuinely isolated opening of something questionable, Windows Sandbox
-(Pro/Enterprise) or a VM is the right tool. Docker here is not it.
+For genuinely isolated opening of something questionable, Windows Sandbox or a
+VM is the right tool. Docker here is not it.

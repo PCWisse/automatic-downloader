@@ -1,74 +1,139 @@
 # ===========================================================================
-#  NO-VPN qBittorrent -- BENCHMARKING ONLY
+#  FULL STACK, NO VPN
 # ===========================================================================
 #
-#  ⚠  ANY torrent added here puts YOUR REAL IP INTO THE SWARM.
-#     Every peer sees it. So does anyone monitoring the swarm, which for
-#     public trackers includes copyright-enforcement firms who log IPs
-#     precisely this way. There is no kill switch here -- that is the point
-#     of the file, and the reason it is separate.
+#  ⚠  qBittorrent AND Prowlarr connect DIRECTLY to the internet here. Every
+#     peer in a torrent swarm sees your real IP. Every indexer search reveals
+#     which sites you query to your ISP. There is NO kill switch -- that is
+#     the entire point of this file existing, and why switching to it is a
+#     deliberate action, never an accident.
 #
-#  This is a SEPARATE instance. It does not touch the VPN-protected stack:
-#    - different project name      (downloader-novpn)
-#    - different container name    (qbittorrent-novpn)
-#    - different WebUI port        (8091, not 8090)
-#    - different config volume     (its own settings + torrent list)
-#    - different download folder   (D:\Torrents-novpn, not D:\Torrents)
+#  This is NOT a second instance running alongside the protected stack --
+#  it is an ALTERNATIVE to it. Same project name (`downloader`), same
+#  container names, same ports, same volumes. You run ONE of these two files
+#  at a time, never both:
 #
-#  The protected stack keeps running normally while this is up. Nothing you
-#  do here can leak into it, and nothing here inherits its torrents.
+#      docker compose -f docker-compose.yml up -d          # VPN-protected
+#      docker compose -f docker-compose.novpn.yml up -d    # no VPN
 #
-#  ---------------------------------------------------------------------
-#  START (explicit -f is required -- it can never start by accident):
-#      docker compose -f docker-compose.novpn.yml up -d
+#  Switching between them reuses all your existing data -- library, Sonarr/
+#  Radarr settings, indexers, watch history. Nothing is duplicated or lost;
+#  you are only changing HOW qBittorrent and Prowlarr reach the internet, not
+#  starting over.
 #
-#  STOP (do this as soon as you are done measuring):
-#      docker compose -f docker-compose.novpn.yml down
+#  The only structural differences from docker-compose.yml:
+#    - no gluetun service at all
+#    - qbittorrent and prowlarr publish their own ports directly, instead of
+#      through gluetun's shared network namespace
+#    - byparr has no network_mode override either, for the same reason
+#    - speed-monitor and the setup script are told to reach qBittorrent/
+#      Prowlarr by their own container names instead of via gluetun
 #
-#  WebUI: http://localhost:8091   (localhost only)
-#  ---------------------------------------------------------------------
-#
-#  For measuring RAW CONNECTION SPEED you do not need this at all --
-#  `.\speedtest.ps1` compares direct vs tunnelled throughput without putting
-#  a single packet into a torrent swarm. Use that first. Only use this file
-#  if you specifically need to observe qBittorrent's own behaviour (peer
-#  counts, stall behaviour, swarm connectivity) without the tunnel.
-#
-#  If you do test here, prefer a torrent nobody objects to you having --
-#  a Linux distro ISO from a well-seeded official tracker is the standard
-#  choice, and its large well-populated swarm is also the better benchmark.
+#  Sonarr, Radarr, Bazarr, SABnzbd, Jellyfin, Recyclarr: byte-for-byte
+#  identical to docker-compose.yml. They were never VPN-routed in the
+#  protected stack either -- nothing about them changes here.
 # ===========================================================================
 
-name: downloader-novpn
+name: downloader
 
 services:
-  qbittorrent-novpn:
+  qbittorrent:
     image: lscr.io/linuxserver/qbittorrent:latest
-    container_name: qbittorrent-novpn
-    # No network_mode, no gluetun: this talks straight to the internet.
+    container_name: qbittorrent
     ports:
-      - 127.0.0.1:8091:8091      # WebUI, localhost only -- not even the LAN
-      # Torrenting port published on ALL interfaces (0.0.0.0), unlike the WebUI
-      # above. This is the one thing Privado can never offer: real incoming peer
-      # connections. Docker publishing this is necessary but NOT sufficient --
-      # your router also needs to forward 6882 (TCP+UDP) to this PC for it to
-      # actually work from the internet. Without that router step, this
-      # container is exactly as inbound-blocked as it was before, just for a
-      # different reason (ISP NAT instead of Privado's policy).
-      - 6882:6882/tcp
-      - 6882:6882/udp
+      - 127.0.0.1:8090:8090      # WebUI -- must match WEBUI_PORT below
+      - 6881:6881/tcp             # Torrenting port, published directly now --
+      - 6881:6881/udp             # there is no gluetun to publish it for you
     environment:
       - PUID=1000
       - PGID=1000
-      - TZ=Europe/Amsterdam
-      - WEBUI_PORT=8091
-      - TORRENTING_PORT=6882     # distinct from the protected instance's 6881
+      - TZ=${TZ:-Etc/UTC}
+      - WEBUI_PORT=8090
+      - TORRENTING_PORT=6881
     volumes:
-      - qbittorrent-novpn-config:/config
-      - D:/Torrents-novpn:/data
-    # Deliberately NOT "unless-stopped": this must never survive a reboot or
-    # come back on its own. Every run should be a decision you just made.
-    restart: "no"
+      - qbittorrent-config:/config
+      - ${MEDIA_ROOT}:/data
+    restart: unless-stopped
+
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr
+    ports:
+      - 127.0.0.1:9696:9696
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ:-Etc/UTC}
+    volumes:
+      - prowlarr-config:/config
+    restart: unless-stopped
+
+  byparr:
+    image: ghcr.io/thephaseless/byparr:latest
+    container_name: byparr
+    # No network_mode override here -- joins this file's own default network,
+    # same as every other service. Prowlarr still reaches it as
+    # http://byparr:8191 via Compose's built-in service-name DNS.
+    shm_size: 2gb
+    environment:
+      - TZ=${TZ:-Etc/UTC}
+    restart: unless-stopped
+
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: sonarr
+    ports:
+      - 127.0.0.1:8989:8989
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ:-Etc/UTC}
+    volumes:
+      - sonarr-config:/config
+      - ${MEDIA_ROOT}:/data
+    restart: unless-stopped
+
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: radarr
+    ports:
+      - 127.0.0.1:7878:7878
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ:-Etc/UTC}
+    volumes:
+      - radarr-config:/config
+      - ${MEDIA_ROOT}:/data
+    restart: unless-stopped
+
+  bazarr:
+    image: lscr.io/linuxserver/bazarr:latest
+    container_name: bazarr
+    ports:
+      - 127.0.0.1:6767:6767
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ:-Etc/UTC}
+    volumes:
+      - bazarr-config:/config
+      - ${MEDIA_ROOT}:/data
+    restart: unless-stopped
+
+  sabnzbd:
+    image: lscr.io/linuxserver/sabnzbd:latest
+    container_name: sabnzbd
+    ports:
+      - 127.0.0.1:8080:8080
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ:-Etc/UTC}
+    volumes:
+      - sabnzbd-config:/config
+      - ${MEDIA_ROOT}:/data
+    restart: unless-stopped
 
   jellyfin:
     image: lscr.io/linuxserver/jellyfin:latest
@@ -78,18 +143,14 @@ services:
     environment:
       - PUID=1000
       - PGID=1000
-      - TZ=Europe/Amsterdam
+      - TZ=${TZ:-Etc/UTC}
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
     volumes:
-      - jellyfin-config:/config                # SQLite DB -- keep off drvfs
+      - jellyfin-config:/config
       - jellyfin-cache:/cache
-      # Read-only: Jellyfin has no business writing to files qBittorrent may
-      # still be seeding. Only /complete is exposed, so partial downloads in
-      # /incomplete are never visible to the library.
-      - D:/Torrents/complete:/media:ro
-    # Hardware transcoding on the RTX 3070 Ti (verified: h264_nvenc encodes).
-    # Remove this block if you ever move the stack to a machine without NVIDIA.
+      - ${MEDIA_ROOT}/library:/media:ro
+    # No NVIDIA GPU? Delete this deploy: block or the container won't start.
     deploy:
       resources:
         reservations:
@@ -98,23 +159,81 @@ services:
               count: all
               capabilities: [gpu]
     restart: unless-stopped
-# ---------------------------------------------------------------------------
-# FIRST RUN ONLY: qBittorrent's factory-default save path is /downloads, which
-# does not exist in this container -- only /data is mounted above. A fresh
-# config volume WILL hit "Permission denied" file errors on every torrent
-# until the save path is corrected. Fixed once here, it persists in the volume:
-#
-#   docker compose -f docker-compose.novpn.yml stop qbittorrent-novpn
-#   docker run --rm -v downloader-novpn_qbittorrent-novpn-config:/config alpine sh -c "
-#     sed -i 's|=/downloads/incomplete/|=/data/incomplete/|g; s|=/downloads/|=/data/complete/|g' /config/qBittorrent/qBittorrent.conf"
-#   docker compose -f docker-compose.novpn.yml up -d
-#
-# Or just set it by hand in the WebUI: Options -> Downloads -> Save files to
-# /data/complete, incomplete to /data/incomplete -- either way, do this BEFORE
-# adding a torrent.
-# ---------------------------------------------------------------------------
+
+  recyclarr:
+    image: ghcr.io/recyclarr/recyclarr:8
+    container_name: recyclarr
+    user: 1000:1000
+    environment:
+      - TZ=${TZ:-Etc/UTC}
+      - CRON_SCHEDULE=0 3 * * *
+    volumes:
+      - ./recyclarr-config:/config
+    restart: unless-stopped
+
+  speed-monitor:
+    image: python:3.12-alpine
+    container_name: speed-monitor
+    working_dir: /app
+    volumes:
+      - ./speed-monitor:/app:ro
+      - ./speed-monitor/state:/state
+    environment:
+      # Only real difference from docker-compose.yml: qBittorrent is its own
+      # container now, not reached through gluetun.
+      - QBIT_URL=http://qbittorrent:8090
+      - QBIT_USER=${QBITTORRENT_USER}
+      - QBIT_PASSWORD=${QBITTORRENT_PASSWORD}
+      - SONARR_URL=http://sonarr:8989
+      - SONARR_API_KEY=${SONARR_API_KEY}
+      - RADARR_URL=http://radarr:7878
+      - RADARR_API_KEY=${RADARR_API_KEY}
+      - SPEED_THRESHOLD_BPS=524288
+      - SUSTAINED_SECONDS=900
+      - GRACE_PERIOD_SECONDS=600
+      - POLL_INTERVAL_SECONDS=60
+      - MAX_RETRIES=2
+      - PROGRESS_GUARD=0.20
+    command: sh -c "pip install --no-cache-dir requests --quiet && python monitor.py"
+    restart: unless-stopped
+
+  # docker compose -f docker-compose.novpn.yml run --rm setup
+  setup:
+    profiles: ["setup"]
+    image: python:3.12-alpine
+    working_dir: /app
+    volumes:
+      - ./setup:/app:ro
+      - sonarr-config:/keys/sonarr:ro
+      - radarr-config:/keys/radarr:ro
+      - prowlarr-config:/keys/prowlarr:ro
+      - bazarr-config:/keys/bazarr:ro
+      - sabnzbd-config:/keys/sabnzbd:ro
+    environment:
+      # Only real difference from docker-compose.yml's setup service: no
+      # gluetun, so qBittorrent/Prowlarr are addressed by their own container
+      # names directly. configure.py reads these three -- see its top for
+      # what each one does.
+      - QBIT_URL=http://qbittorrent:8090
+      - PROWLARR_URL=http://prowlarr:9696
+      - QBIT_HOST=qbittorrent
+      - QBITTORRENT_USER=${QBITTORRENT_USER:-}
+      - QBITTORRENT_PASSWORD=${QBITTORRENT_PASSWORD:-}
+      - JELLYFIN_ADMIN_USER=${JELLYFIN_ADMIN_USER:-}
+      - JELLYFIN_ADMIN_PASSWORD=${JELLYFIN_ADMIN_PASSWORD:-}
+      - QBIT_MAX_ACTIVE_DOWNLOADS=4
+      - QBIT_SEED_RATIO_LIMIT=1.0
+      - QBIT_SEED_TIME_LIMIT_MIN=180
+      - INDEXER_MIN_SEEDERS=5
+      - MAX_SIZE_MB_PER_MIN_2160P=252
+    command: sh -c "pip install --no-cache-dir requests pyyaml --quiet && python configure.py"
 
 volumes:
-  qbittorrent-novpn-config:
+  qbittorrent-config:
+  prowlarr-config:
+  sonarr-config:
+  radarr-config:
+  bazarr-config:
+  sabnzbd-config:
   jellyfin-config:
   jellyfin-cache:

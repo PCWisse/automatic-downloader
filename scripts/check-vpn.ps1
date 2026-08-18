@@ -1,17 +1,23 @@
 # Verifies that qBittorrent's traffic actually leaves through the VPN,
 # and that the kill switch works. Run this after every config change.
 
-# Safety net: the benchmarking instance from docker-compose.novpn.yml has no
-# VPN at all. If it was left running, say so loudly -- it is easy to forget.
-if ((docker inspect -f '{{.State.Running}}' qbittorrent-novpn 2>$null) -eq 'true') {
+# Safety net: docker-compose.novpn.yml runs the SAME container names with no
+# VPN at all -- if that file is what's currently up (not docker-compose.yml),
+# qbittorrent exists but gluetun does not. Say so loudly before the rest of
+# this script runs, since steps 1-3 below will otherwise just look like a
+# leak without explaining why.
+$qbitRunning = (docker inspect -f '{{.State.Running}}' qbittorrent 2>$null) -eq 'true'
+$gluetunExists = $null -ne (docker inspect -f '{{.State.Running}}' gluetun 2>$null)
+if ($qbitRunning -and -not $gluetunExists) {
     Write-Host ""
     Write-Host "  *********************************************************" -ForegroundColor Red
-    Write-Host "  *  WARNING: qbittorrent-novpn is RUNNING                *" -ForegroundColor Red
-    Write-Host "  *  That instance has NO VPN. Any torrent in it exposes  *" -ForegroundColor Red
-    Write-Host "  *  your real IP to the swarm.                           *" -ForegroundColor Red
+    Write-Host "  *  WARNING: running docker-compose.novpn.yml right now  *" -ForegroundColor Red
+    Write-Host "  *  qBittorrent has NO VPN in this mode. Any torrent     *" -ForegroundColor Red
+    Write-Host "  *  exposes your real IP to the swarm.                   *" -ForegroundColor Red
     Write-Host "  *                                                       *" -ForegroundColor Red
-    Write-Host "  *  Shut it down when finished benchmarking:             *" -ForegroundColor Red
+    Write-Host "  *  Switch back when you're done:                        *" -ForegroundColor Red
     Write-Host "  *    docker compose -f docker-compose.novpn.yml down    *" -ForegroundColor Red
+    Write-Host "  *    docker compose up -d                               *" -ForegroundColor Red
     Write-Host "  *********************************************************" -ForegroundColor Red
 }
 
@@ -35,7 +41,7 @@ if (-not $vpn) {
 Write-Host "`n== 4. gluetun's reported public IP ==" -ForegroundColor Cyan
 # The control server requires an API key. Read it from the auth config so there
 # is a single source of truth -- rotate the key there, not here.
-$authFile = Join-Path $PSScriptRoot "gluetun-auth.toml"
+$authFile = Join-Path (Split-Path $PSScriptRoot -Parent) "gluetun-auth.toml"
 $apiKey = $null
 if (Test-Path $authFile) {
     $apiKey = (Select-String -Path $authFile -Pattern '^\s*apikey\s*=\s*"(.+)"' | Select-Object -First 1).Matches.Groups[1].Value
@@ -66,7 +72,10 @@ if ($state -ne 'true') {
     }
 }
 Write-Host "Restarting stack..."
-docker compose -f "$PSScriptRoot\docker-compose.yml" up -d | Out-Null
-# qBittorrent's namespace died with gluetun; it must be restarted to rejoin it.
-docker compose -f "$PSScriptRoot\docker-compose.yml" restart qbittorrent | Out-Null
+docker compose -f "$(Split-Path $PSScriptRoot -Parent)\docker-compose.yml" up -d | Out-Null
+# qBittorrent AND Prowlarr both share gluetun's namespace, which died with it;
+# both must be restarted to rejoin the new one. Missing prowlarr here was a
+# real bug -- caught live: it silently sat on the dead namespace with no
+# network path at all until this restart was added.
+docker compose -f "$(Split-Path $PSScriptRoot -Parent)\docker-compose.yml" restart qbittorrent prowlarr | Out-Null
 Write-Host "Done.`n"

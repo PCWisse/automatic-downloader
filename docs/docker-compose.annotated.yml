@@ -1,0 +1,331 @@
+# ===========================================================================
+#  ANNOTATED REFERENCE COPY -- read this, don't run it
+#
+#  This file is NOT used by `docker compose up`. It exists purely so the
+#  reasoning behind every non-obvious line lives next to that line, instead of
+#  scattered across the README. The real file is docker-compose.yml, kept
+#  deliberately clean.
+#
+#  If you change docker-compose.yml (repo root), update the matching lines
+#  here too -- nothing enforces that automatically. Diff them occasionally,
+#  run from the repo root:
+#
+#    git diff --no-index docker-compose.yml docs/docker-compose.annotated.yml
+#
+#  (expect that diff to be "noisy" -- only comments should differ)
+# ===========================================================================
+
+# Project name pinned explicitly. Without this, Compose derives the project
+# name from the FOLDER name -- so renaming the folder silently orphans every
+# container and every named volume: Compose would look for
+# `newfolder_qbittorrent-config`, not find it, and quietly create an empty
+# one. Torrents, settings and password gone, no error. Pinning it means this
+# folder can be renamed or moved freely.
+name: downloader
+
+services:
+  # ---------------------------------------------------------------
+  # gluetun owns the VPN tunnel AND the network namespace that qBittorrent
+  # and Prowlarr both join. If the tunnel drops, they lose ALL connectivity --
+  # that's the kill switch, and it's structural, not a setting that can be
+  # forgotten.
+  # ---------------------------------------------------------------
+  gluetun:
+    image: qmcgaw/gluetun:v3
+    container_name: gluetun
+    cap_add:
+      - NET_ADMIN
+      # Required to build the tunnel interface and firewall rules. Verified:
+      # without it, gluetun fails at startup with
+      # "NET_ADMIN capability is missing: ... Permission denied (you must be root)"
+    devices:
+      - /dev/net/tun:/dev/net/tun
+      # The kernel's TUN driver device node -- this is the actual tunnel
+      # interface OpenVPN attaches to. On some hosts gluetun can self-heal by
+      # mknod'ing this if NET_ADMIN is present and the driver is loaded, but
+      # that's implicit and not guaranteed everywhere; keep this explicit.
+    ports:
+      # These ports are published HERE, not on qbittorrent/prowlarr below.
+      # A container using `network_mode: service:gluetun` shares gluetun's
+      # network namespace and CANNOT publish its own ports -- Docker
+      # hard-errors if you try. Every port for every VPN-side service must be
+      # listed on this one service.
+      #
+      # Deliberately off the defaults 8080/8000: both are heavily contested on
+      # a dev machine (8080 = Tomcat/webpack/Spring Boot; 8000 = Django,
+      # uvicorn, `python -m http.server`).
+      #
+      # All bound to 127.0.0.1: reachable from this PC only, invisible to the
+      # LAN and to a tailnet. Drop that prefix on a specific line only if you
+      # genuinely need remote access to that one admin UI -- and add HTTPS
+      # first if you do, since the login would otherwise cross the network in
+      # plaintext.
+      - 127.0.0.1:8090:8090 # qBittorrent WebUI     -> must match WEBUI_PORT below
+      - 127.0.0.1:8010:8010 # gluetun control API    -> must match HTTP_CONTROL_SERVER_ADDRESS below
+      - 127.0.0.1:9696:9696 # Prowlarr WebUI (Prowlarr also lives in this namespace)
+    volumes:
+      - gluetun-config:/gluetun
+      - ./gluetun-auth.toml:/gluetun/auth/config.toml:ro
+      # API key auth for the control server (port 8010 above). Without this
+      # file, gluetun's defaults leave some routes -- including
+      # GET /v1/vpn/status -- answering ANYONE who can reach the port with no
+      # credential at all. Verified directly before this file was added.
+      # Supplying this file REPLACES the defaults entirely: anything not
+      # listed in a [[roles]] block inside it is denied outright.
+    environment:
+      # Every value here comes from .env. gluetun itself is provider-agnostic --
+      # switching from Privado to any other provider it supports, or from
+      # OpenVPN to WireGuard, is purely an .env edit. Nothing else in the
+      # stack knows or cares which VPN this is. See .env.example for the full
+      # list of providers and the WireGuard variant of this block.
+      - VPN_SERVICE_PROVIDER=${VPN_SERVICE_PROVIDER:-privado}
+      - VPN_TYPE=${VPN_TYPE:-openvpn}
+      - OPENVPN_USER=${OPENVPN_USER:-}
+      - OPENVPN_PASSWORD=${OPENVPN_PASSWORD:-}
+      - OPENVPN_PROTOCOL=udp                   # tcp if udp is blocked on your network (some ISPs/firewalls do)
+      # Read by gluetun only when VPN_TYPE=wireguard; harmlessly empty otherwise
+      # -- verified directly, gluetun does not validate unused-type variables.
+      - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY:-}
+      - WIREGUARD_ADDRESSES=${WIREGUARD_ADDRESSES:-}
+      - WIREGUARD_PUBLIC_KEY=${WIREGUARD_PUBLIC_KEY:-}
+      - WIREGUARD_ENDPOINT_IP=${WIREGUARD_ENDPOINT_IP:-}
+      - WIREGUARD_ENDPOINT_PORT=${WIREGUARD_ENDPOINT_PORT:-}
+      - SERVER_COUNTRIES=${VPN_COUNTRIES:-Netherlands}
+      # Allow LAN + Docker-internal subnets to bypass the tunnel's firewall so
+      # the WebUIs stay reachable while all OTHER traffic is still forced
+      # through the VPN. This does not weaken the kill switch -- it only
+      # affects traffic to/from private ranges, never the public internet.
+      - FIREWALL_OUTBOUND_SUBNETS=192.168.0.0/16,172.16.0.0/12,10.0.0.0/8
+      - TZ=${TZ:-Etc/UTC}
+      - UPDATER_PERIOD=24h                     # refreshes gluetun's bundled Privado server list
+      - HTTP_CONTROL_SERVER_ADDRESS=:8010      # moved off the default :8000, see the ports note above
+    restart: unless-stopped
+
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: qbittorrent
+    network_mode: service:gluetun              # joins gluetun's namespace -- all traffic via the VPN, no exceptions
+    depends_on:
+      gluetun:
+        condition: service_healthy             # won't start until the tunnel is actually up
+        # NOTE: this only controls STARTUP order. If gluetun is later
+        # restarted or recreated on its own, qbittorrent does NOT
+        # automatically rejoin the new namespace -- see the README section
+        # "Why gluetun changes need a qBittorrent/Prowlarr restart".
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ:-Etc/UTC}
+      - WEBUI_PORT=8090                        # passed as a --webui-port CLI flag, OVERRIDES qBittorrent.conf
+      - TORRENTING_PORT=6881
+    volumes:
+      - qbittorrent-config:/config             # named volume: fast, and never syncs to OneDrive/cloud storage
+      - ${MEDIA_ROOT}:/data
+      # ONE mount for EVERYTHING -- torrents, usenet, and the library all live
+      # under this single root. See the big /data explanation at the bottom
+      # of this file; this is the single most important structural decision
+      # in the whole stack.
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------
+  # Prowlarr is the indexer manager -- the one place search sources get
+  # configured, syncing them out to Sonarr and Radarr.
+  #
+  # It lives behind the VPN like qBittorrent: it queries indexer sites
+  # directly, and hiding which sites you query from your ISP is worth doing.
+  # Its port is published on gluetun above, not here (same namespace rule).
+  # ---------------------------------------------------------------
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr
+    network_mode: service:gluetun
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ:-Etc/UTC}
+    volumes:
+      - prowlarr-config:/config
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------
+  # Sonarr / Radarr / Bazarr / SABnzbd are deliberately NOT behind the VPN.
+  #
+  #   - Sonarr/Radarr talk HTTPS to metadata APIs (TheTVDB, TMDb). Nothing to
+  #     hide, and the VPN would only add latency.
+  #   - SABnzbd makes one direct SSL connection to your Usenet provider --
+  #     there's no "swarm" the way there is with torrents. Tunnelling it would
+  #     throw away most of your download speed for no privacy benefit.
+  #
+  # They reach the VPN-side services by gluetun's CONTAINER NAME, since that's
+  # the namespace's actual owner on the Docker network -- "localhost" from
+  # inside these containers means themselves, not gluetun:
+  #   qBittorrent -> http://gluetun:8090
+  #   Prowlarr    -> http://gluetun:9696
+  # ---------------------------------------------------------------
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: sonarr
+    ports:
+      - 127.0.0.1:8989:8989
+      # Sonarr has its own network namespace (no network_mode override), so
+      # unlike gluetun's services, this port is safe to change directly here
+      # with nothing else to keep in sync.
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ:-Etc/UTC}
+    volumes:
+      - sonarr-config:/config
+      - ${MEDIA_ROOT}:/data                    # same single mount as every other service -- hardlinks depend on this
+    restart: unless-stopped
+
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: radarr
+    ports:
+      - 127.0.0.1:7878:7878
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ:-Etc/UTC}
+    volumes:
+      - radarr-config:/config
+      - ${MEDIA_ROOT}:/data
+    restart: unless-stopped
+
+  bazarr:
+    image: lscr.io/linuxserver/bazarr:latest
+    container_name: bazarr
+    ports:
+      - 127.0.0.1:6767:6767
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ:-Etc/UTC}
+    volumes:
+      - bazarr-config:/config
+      - ${MEDIA_ROOT}:/data                    # needs the library mount to write .srt files next to each video
+    restart: unless-stopped
+
+  sabnzbd:
+    image: lscr.io/linuxserver/sabnzbd:latest
+    container_name: sabnzbd
+    ports:
+      - 127.0.0.1:8080:8080
+      # 8080 is free here specifically because qBittorrent was moved off it
+      # onto 8090 earlier in this project's history -- otherwise these two
+      # would collide.
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ:-Etc/UTC}
+    volumes:
+      - sabnzbd-config:/config
+      - ${MEDIA_ROOT}:/data
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------
+  # Jellyfin deliberately does NOT use the VPN. It needs to be reachable from
+  # your LAN (phones, TVs) and to fetch artwork/metadata from the internet.
+  # Routing it through Privado would break LAN reachability and add nothing --
+  # there is no privacy reason to hide "I am serving my own files to myself."
+  # ---------------------------------------------------------------
+  jellyfin:
+    image: lscr.io/linuxserver/jellyfin:latest
+    container_name: jellyfin
+    ports:
+      - 8096:8096
+      # No 127.0.0.1 prefix, unlike every other service -- this one is meant
+      # to be reachable from your whole LAN (and a tailnet, if you add
+      # Tailscale). This requires an inbound Windows Firewall rule; Docker
+      # publishing the port is not sufficient on its own -- see the README
+      # troubleshooting entry "Jellyfin shows several servers and none work".
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ:-Etc/UTC}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
+    volumes:
+      - jellyfin-config:/config                # holds a SQLite DB -- keep this a named volume, not a Windows bind mount
+      - jellyfin-cache:/cache
+      - ${MEDIA_ROOT}/library:/media:ro
+      # Read-only, and scoped to ONLY the curated /library subfolder -- not
+      # the raw torrents/usenet download folders. Sonarr/Radarr hardlink
+      # finished, properly-named files into /library; Jellyfin therefore
+      # never sees a partial download or a messy release folder name.
+      # Read-only also means Jellyfin's "delete" button won't work -- that's
+      # intentional, since deleting a file qBittorrent is still seeding would
+      # break the torrent. Delete through qBittorrent instead.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+      # Hardware transcoding. Passing the GPU through like this is necessary
+      # but NOT sufficient -- it must also be enabled inside Jellyfin's own
+      # settings (Dashboard -> Playback -> Transcoding -> NVENC) or it will
+      # silently keep using the CPU.
+      #
+      # No NVIDIA GPU on your machine? Delete this whole `deploy:` block, or
+      # the container will fail to start at all.
+    restart: unless-stopped
+
+# ===========================================================================
+#  THE /data LAYOUT -- why every service mounts MEDIA_ROOT at the same path
+# ===========================================================================
+#
+#   MEDIA_ROOT/            ->  /data   (identical path in every container)
+#   ├── torrents/complete      finished torrents, still seeding
+#   ├── torrents/incomplete    partial downloads
+#   ├── usenet/complete        finished Usenet downloads
+#   ├── usenet/incomplete      partial Usenet downloads
+#   └── library/movies|tv      the curated library Jellyfin reads
+#
+# Sonarr/Radarr "import" a finished download by creating a HARDLINK from the
+# download folder into the library: a second directory entry pointing at the
+# exact same bytes on disk. It's instant, uses no extra disk space, and
+# leaves the original file in place so qBittorrent can keep seeding it.
+#
+# Hardlinks only work WITHIN one filesystem mount. Verified directly on this
+# setup with a real hardlink:
+#
+#   ln /data/torrents/complete/file.mkv /data/library/movies/file.mkv
+#   -> links=2  inode=2251799814069397   (same inode = one copy of the data)
+#
+# Mount the download folder and the library as two SEPARATE bind mounts
+# instead -- even onto the same physical drive -- and this breaks. Proven on
+# this exact setup:
+#
+#   ln: failed to create hard link '.../file.mkv' : Cross-device link
+#
+# That's EXDEV: Linux refuses hardlinks (and atomic renames) across mount
+# points, full stop, regardless of the underlying disk. Without a single
+# mount, Sonarr/Radarr fall back to copying every file instead of linking it
+# -- each import takes minutes instead of being instant, needs double the
+# disk space during the copy, and during that copy Jellyfin's file watcher can
+# pick up a partial, still-growing file as if it were a finished one.
+#
+# The IDENTICAL path in every container matters too, separately from the
+# hardlink issue. Sonarr tells qBittorrent's API "the completed download is at
+# /data/torrents/complete/<name>". If qBittorrent's own view of that folder
+# were mounted at a different path (say /downloads), Sonarr would ask
+# qBittorrent to look somewhere that doesn't exist from qBittorrent's side,
+# and the import would fail outright.
+# ===========================================================================
+
+volumes:
+  gluetun-config:
+  qbittorrent-config:
+  prowlarr-config:
+  sonarr-config:
+  radarr-config:
+  bazarr-config:
+  sabnzbd-config:
+  jellyfin-config:
+  jellyfin-cache:
