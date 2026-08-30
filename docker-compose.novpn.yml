@@ -41,7 +41,7 @@ services:
     image: lscr.io/linuxserver/qbittorrent:latest
     container_name: qbittorrent
     ports:
-      - 127.0.0.1:8090:8090      # WebUI -- must match WEBUI_PORT below
+      - ${BIND_ADDRESS:-127.0.0.1}:8090:8090      # WebUI -- must match WEBUI_PORT below
       - 6881:6881/tcp             # Torrenting port, published directly now --
       - 6881:6881/udp             # there is no gluetun to publish it for you
     environment:
@@ -59,7 +59,7 @@ services:
     image: lscr.io/linuxserver/prowlarr:latest
     container_name: prowlarr
     ports:
-      - 127.0.0.1:9696:9696
+      - ${BIND_ADDRESS:-127.0.0.1}:9696:9696
     environment:
       - PUID=1000
       - PGID=1000
@@ -83,7 +83,7 @@ services:
     image: lscr.io/linuxserver/sonarr:latest
     container_name: sonarr
     ports:
-      - 127.0.0.1:8989:8989
+      - ${BIND_ADDRESS:-127.0.0.1}:8989:8989
     environment:
       - PUID=1000
       - PGID=1000
@@ -97,7 +97,7 @@ services:
     image: lscr.io/linuxserver/radarr:latest
     container_name: radarr
     ports:
-      - 127.0.0.1:7878:7878
+      - ${BIND_ADDRESS:-127.0.0.1}:7878:7878
     environment:
       - PUID=1000
       - PGID=1000
@@ -111,7 +111,7 @@ services:
     image: lscr.io/linuxserver/bazarr:latest
     container_name: bazarr
     ports:
-      - 127.0.0.1:6767:6767
+      - ${BIND_ADDRESS:-127.0.0.1}:6767:6767
     environment:
       - PUID=1000
       - PGID=1000
@@ -125,7 +125,7 @@ services:
     image: lscr.io/linuxserver/sabnzbd:latest
     container_name: sabnzbd
     ports:
-      - 127.0.0.1:8080:8080
+      - ${BIND_ADDRESS:-127.0.0.1}:8080:8080
     environment:
       - PUID=1000
       - PGID=1000
@@ -150,7 +150,11 @@ services:
       - jellyfin-config:/config
       - jellyfin-cache:/cache
       - ${MEDIA_ROOT}/library:/media:ro
-    # No NVIDIA GPU? Delete this deploy: block or the container won't start.
+    # NVIDIA GPU assumed by default. AMD/Intel iGPU (VAAPI)? Layer
+    # docker-compose.gpu-amd.yml on top -- it removes this block for you, no
+    # editing needed. See README's "Using an AMD or Intel GPU instead of
+    # NVIDIA". No GPU at all? Delete this deploy: block, or the container
+    # won't start.
     deploy:
       resources:
         reservations:
@@ -158,6 +162,21 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+    restart: unless-stopped
+
+  # Identical to docker-compose.yml's jellyseerr -- it was never VPN-routed
+  # there either, so nothing changes. See that file for the full comment.
+  jellyseerr:
+    image: fallenbagel/jellyseerr:latest
+    container_name: jellyseerr
+    ports:
+      - ${BIND_ADDRESS:-127.0.0.1}:5055:5055
+    environment:
+      - LOG_LEVEL=info
+      - TZ=${TZ:-Etc/UTC}
+      - PORT=5055
+    volumes:
+      - jellyseerr-config:/app/config
     restart: unless-stopped
 
   recyclarr:
@@ -194,6 +213,7 @@ services:
       - POLL_INTERVAL_SECONDS=60
       - MAX_RETRIES=2
       - PROGRESS_GUARD=0.20
+      - INDEXER_CHECK_INTERVAL_SECONDS=900
     command: sh -c "pip install --no-cache-dir requests --quiet && python monitor.py"
     restart: unless-stopped
 
@@ -210,10 +230,10 @@ services:
       - bazarr-config:/keys/bazarr:ro
       - sabnzbd-config:/keys/sabnzbd:ro
     environment:
-      # Only real difference from docker-compose.yml's setup service: no
-      # gluetun, so qBittorrent/Prowlarr are addressed by their own container
-      # names directly. configure.py reads these three -- see its top for
-      # what each one does.
+      # Real difference from docker-compose.yml's setup service: no gluetun,
+      # so qBittorrent/Prowlarr are addressed by their own container names
+      # directly. configure.py reads these three -- see its top for what
+      # each one does.
       - QBIT_URL=http://qbittorrent:8090
       - PROWLARR_URL=http://prowlarr:9696
       - QBIT_HOST=qbittorrent
@@ -221,6 +241,12 @@ services:
       - QBITTORRENT_PASSWORD=${QBITTORRENT_PASSWORD:-}
       - JELLYFIN_ADMIN_USER=${JELLYFIN_ADMIN_USER:-}
       - JELLYFIN_ADMIN_PASSWORD=${JELLYFIN_ADMIN_PASSWORD:-}
+      # nvidia (default), amd, or none -- see docker-compose.yml's setup
+      # service for what this controls. Must match whichever compose file(s)
+      # you launched with.
+      - GPU_VENDOR=${GPU_VENDOR:-nvidia}
+      - JELLYSEERR_QUALITY_PROFILE=${JELLYSEERR_QUALITY_PROFILE:-HD-1080p}
+      - JELLYSEERR_ADMIN_EMAIL=${JELLYSEERR_ADMIN_EMAIL:-}
       - QBIT_MAX_ACTIVE_DOWNLOADS=4
       - QBIT_SEED_RATIO_LIMIT=1.0
       - QBIT_SEED_TIME_LIMIT_MIN=180
@@ -237,3 +263,4 @@ volumes:
   sabnzbd-config:
   jellyfin-config:
   jellyfin-cache:
+  jellyseerr-config:

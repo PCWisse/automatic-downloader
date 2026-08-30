@@ -14,6 +14,13 @@ here is ever deleted automatically anymore.
 
 Usenet (SABnzbd) is deliberately not covered: there is no "seeders" concept
 and no alternate release to fall back to the way there is with torrents.
+
+Also watches for indexers stuck in Sonarr/Radarr's failure backoff. Those keep
+their own backoff, separate from Prowlarr's, and it does not always clear once
+a tracker recovers -- leaving searches to report "0 active indexers" and return
+nothing, which is indistinguishable from "no releases exist" unless you go
+looking in the logs. Re-testing a parked indexer clears it, so that runs here
+on a slow timer.
 """
 
 import json
@@ -39,6 +46,19 @@ PROGRESS_GUARD = float(os.environ.get("PROGRESS_GUARD", 0.20))  # 20%
 STATE_FILE = os.environ.get("RETRY_STATE_FILE", "/state/retry_state.json")
 
 ACTIVE_STATES = {"downloading", "stalledDL", "metaDL", "forcedDL"}
+
+# How often to look for indexers stuck in Sonarr/Radarr's failure backoff.
+# Deliberately far slower than POLL_INTERVAL_SECONDS: each retest is a real
+# request to a real tracker, so this must not run on the 60s download loop.
+INDEXER_CHECK_INTERVAL_SECONDS = int(os.environ.get("INDEXER_CHECK_INTERVAL_SECONDS", 15 * 60))
+
+
+# Sonarr/Radarr health-check identifiers for "indexers are in backoff". Matched
+# on `source` rather than the message text, which is prose and changes.
+INDEXER_HEALTH_SOURCES = {"IndexerStatusCheck", "IndexerLongTermStatusCheck"}
+
+# Unix timestamp of the last indexer sweep. 0 = never, so the first cycle runs.
+last_indexer_check: float = 0.0
 
 # hash -> unix timestamp when it first dropped below the threshold.
 # In-memory only -- resetting this on restart just gives a slow torrent a
@@ -199,6 +219,75 @@ def grab_alternative_release(app_name: str, base_url: str, api_key: str, rec: di
         return False
 
 
+def stuck_indexer_names(base_url: str, api_key: str) -> set[str]:
+    """Names of indexers Sonarr/Radarr has parked in its failure backoff.
+
+    Sonarr/Radarr keep their OWN backoff, separate from Prowlarr's. An indexer
+    that recovered on Prowlarr's side can stay parked here, and while it is,
+    searches log "0 active indexers" and silently return nothing -- which looks
+    exactly like "no releases exist" from the outside.
+    """
+    r = requests.get(f"{base_url}/api/v3/health", headers={"X-Api-Key": api_key}, timeout=15)
+    r.raise_for_status()
+    names: set[str] = set()
+    for item in r.json():
+        if item.get("source") not in INDEXER_HEALTH_SOURCES:
+            continue
+        # "Indexers unavailable due to failures: 1337x (Prowlarr), YTS (Prowlarr)"
+        _, _, listed = item.get("message", "").partition(":")
+        names.update(n.strip() for n in listed.split(",") if n.strip())
+    return names
+
+
+def retest_stuck_indexers(app_name: str, base_url: str, api_key: str) -> None:
+    """Re-test parked indexers. A passing test clears the backoff, which is all
+    the UI's Test button does -- this is that, on a timer."""
+    try:
+        stuck = stuck_indexer_names(base_url, api_key)
+    except requests.RequestException as e:
+        log(f"WARN: could not read {app_name} health: {e}")
+        return
+    if not stuck:
+        return
+
+    try:
+        indexers = requests.get(f"{base_url}/api/v3/indexer", headers={"X-Api-Key": api_key}, timeout=15).json()
+    except requests.RequestException as e:
+        log(f"WARN: could not list {app_name} indexers: {e}")
+        return
+
+    # Names come out of prose, so a parse miss is possible. Falling back to all
+    # indexers is safe here: we only reach this branch when the health check
+    # already told us something IS parked.
+    targets = [i for i in indexers if i.get("name") in stuck] or indexers
+    log(f"{app_name}: {len(targets)} indexer(s) in failure backoff, re-testing")
+
+    for idx in targets:
+        name = idx.get("name", "?")
+        try:
+            r = requests.post(
+                f"{base_url}/api/v3/indexer/test",
+                headers={"X-Api-Key": api_key},
+                json=idx,
+                timeout=90,
+            )
+        except requests.RequestException as e:
+            log(f"  {app_name}: {name} still unreachable ({e})")
+            continue
+        if r.ok:
+            log(f"  {app_name}: {name} RECOVERED -- backoff cleared")
+        else:
+            log(f"  {app_name}: {name} still failing (HTTP {r.status_code}) -- leaving it parked")
+
+
+def check_indexers() -> None:
+    for app_name, base_url, api_key in (
+        ("sonarr", SONARR_URL, SONARR_API_KEY),
+        ("radarr", RADARR_URL, RADARR_API_KEY),
+    ):
+        retest_stuck_indexers(app_name, base_url, api_key)
+
+
 def resolve_episode(key: str) -> None:
     """MAX_RETRIES reached: pick the best-progressed stopped candidate, resume
     it, leave the rest stopped (never deleted), and stop managing this item."""
@@ -292,17 +381,28 @@ def main() -> None:
     log(
         f"config: threshold={SPEED_THRESHOLD_BPS/1024/1024:.2f} MiB/s, "
         f"sustained={SUSTAINED_SECONDS/60:.0f} min, grace={GRACE_PERIOD_SECONDS/60:.0f} min, "
-        f"poll={POLL_INTERVAL_SECONDS}s, max_retries={MAX_RETRIES}, progress_guard={PROGRESS_GUARD*100:.0f}%"
+        f"poll={POLL_INTERVAL_SECONDS}s, max_retries={MAX_RETRIES}, progress_guard={PROGRESS_GUARD*100:.0f}%, "
+        f"indexer_check={INDEXER_CHECK_INTERVAL_SECONDS/60:.0f} min"
     )
     load_state()
     qbit_login()
     log("qBittorrent login OK")
 
+    global last_indexer_check
     while True:
         try:
             check_once()
         except Exception as e:
             log(f"ERROR in check cycle: {e}")
+
+        # Separate, much slower cadence -- see INDEXER_CHECK_INTERVAL_SECONDS.
+        if time.time() - last_indexer_check >= INDEXER_CHECK_INTERVAL_SECONDS:
+            last_indexer_check = time.time()
+            try:
+                check_indexers()
+            except Exception as e:
+                log(f"ERROR in indexer check: {e}")
+
         time.sleep(POLL_INTERVAL_SECONDS)
 
 

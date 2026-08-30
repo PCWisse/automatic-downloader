@@ -44,11 +44,17 @@ RADARR_URL = "http://radarr:7878"
 BAZARR_URL = "http://bazarr:6767"
 SABNZBD_URL = "http://sabnzbd:8080"
 JELLYFIN_URL = "http://jellyfin:8096"
+JELLYSEERR_URL = "http://jellyseerr:5055"
 
 QBIT_USER = os.environ.get("QBITTORRENT_USER", "")
 QBIT_PASSWORD = os.environ.get("QBITTORRENT_PASSWORD", "")
 JELLYFIN_USER = os.environ.get("JELLYFIN_ADMIN_USER", "")
 JELLYFIN_PASSWORD = os.environ.get("JELLYFIN_ADMIN_PASSWORD", "")
+
+# nvidia (default) -> NVENC, amd -> VAAPI, anything else -> hardware
+# transcoding left off. Must match the compose file(s) actually in use --
+# see docker-compose.gpu-amd.yml.
+GPU_VENDOR = os.environ.get("GPU_VENDOR", "nvidia").lower()
 
 # Tunables that mirror the README's documented values.
 MAX_ACTIVE_DOWNLOADS = int(os.environ.get("QBIT_MAX_ACTIVE_DOWNLOADS", 4))
@@ -56,6 +62,13 @@ SEED_RATIO_LIMIT = float(os.environ.get("QBIT_SEED_RATIO_LIMIT", 1.0))
 SEED_TIME_LIMIT_MIN = int(os.environ.get("QBIT_SEED_TIME_LIMIT_MIN", 180))
 MIN_SEEDERS = int(os.environ.get("INDEXER_MIN_SEEDERS", 5))
 MAX_SIZE_MB_PER_MIN_2160P = int(os.environ.get("MAX_SIZE_MB_PER_MIN_2160P", 252))
+
+# Quality profile Jellyseerr hands to Sonarr/Radarr for new requests. Must be
+# a profile name that exists in them; falls back to the first non-"Any"
+# profile if it doesn't. "Any" is deliberately avoided -- despite the name it
+# EXCLUDES 4K (see README).
+JELLYSEERR_PROFILE = os.environ.get("JELLYSEERR_QUALITY_PROFILE", "HD-1080p")
+JELLYSEERR_EMAIL = os.environ.get("JELLYSEERR_ADMIN_EMAIL", "")
 
 # --- output helpers ----------------------------------------------------------
 
@@ -672,25 +685,40 @@ def configure_jellyfin() -> None:
 
     # Hardware transcoding: passing the GPU through in compose is necessary but
     # NOT sufficient -- it must be switched on here too, or it silently uses CPU.
-    try:
-        enc = requests.get(f"{JELLYFIN_URL}/System/Configuration/encoding", headers=headers, timeout=30).json()
-        if enc.get("HardwareAccelerationType") in ("nvenc", "NVENC"):
-            skip("Jellyfin: NVENC already enabled")
-        else:
-            enc["HardwareAccelerationType"] = "nvenc"
-            enc["EnableHardwareEncoding"] = True
-            enc["EnableTonemapping"] = True  # HDR looks washed out on SDR screens without this
-            r = requests.post(
-                f"{JELLYFIN_URL}/System/Configuration/encoding",
-                headers=headers,
-                json=enc,
-                timeout=30,
-            )
-            r.raise_for_status()
-            ok("Jellyfin: NVENC hardware transcoding + tone mapping enabled")
-            info("(harmless if this machine has no NVIDIA GPU -- Jellyfin falls back to CPU)")
-    except requests.RequestException as e:
-        warn(f"Jellyfin: could not set transcoding options ({e})")
+    if GPU_VENDOR == "none":
+        skip("Jellyfin: hardware transcoding left off (GPU_VENDOR=none)")
+    else:
+        accel_type = "vaapi" if GPU_VENDOR == "amd" else "nvenc"
+        try:
+            enc = requests.get(f"{JELLYFIN_URL}/System/Configuration/encoding", headers=headers, timeout=30).json()
+            if enc.get("HardwareAccelerationType", "").lower() == accel_type:
+                skip(f"Jellyfin: {accel_type} already enabled")
+            else:
+                enc["HardwareAccelerationType"] = accel_type
+                enc["EnableHardwareEncoding"] = True
+                if accel_type == "vaapi":
+                    enc["VaapiDevice"] = "/dev/dri/renderD128"
+                    # Tone mapping deliberately NOT enabled for VAAPI. It needs
+                    # an OpenCL runtime in the container, and on AMD a missing
+                    # one makes HDR transcodes FAIL rather than fall back to
+                    # CPU. Turn it on by hand once you've confirmed 4K HDR
+                    # playback works on your hardware:
+                    #   Dashboard -> Playback -> Enable Tone mapping
+                else:
+                    # HDR looks washed out on SDR screens without this. Safe on
+                    # NVENC, where the tone-mapping path needs no extra runtime.
+                    enc["EnableTonemapping"] = True
+                r = requests.post(
+                    f"{JELLYFIN_URL}/System/Configuration/encoding",
+                    headers=headers,
+                    json=enc,
+                    timeout=30,
+                )
+                r.raise_for_status()
+                ok(f"Jellyfin: {accel_type} hardware transcoding + tone mapping enabled")
+                info(f"(harmless if this machine has no {GPU_VENDOR.upper()} GPU -- Jellyfin falls back to CPU)")
+        except requests.RequestException as e:
+            warn(f"Jellyfin: could not set transcoding options ({e})")
 
     # Real-time monitoring (inotify) only sees writes made from inside a
     # container -- host-side copies (e.g. from Windows Explorer) never trigger
@@ -719,6 +747,158 @@ def configure_jellyfin() -> None:
         warn(f"Jellyfin: could not set startup library scan trigger ({e})")
 
 
+# --- Jellyseerr ---------------------------------------------------------------
+
+
+def configure_jellyseerr(sonarr_key: str, radarr_key: str) -> None:
+    """Complete Jellyseerr's setup wizard: sign in with Jellyfin, enable the
+    libraries, and register Sonarr/Radarr as request targets.
+
+    Unlike every other app here, Jellyseerr authenticates with a SESSION COOKIE
+    rather than an API key -- hence requests.Session() throughout.
+    """
+    step("Jellyseerr")
+
+    if not JELLYFIN_USER or not JELLYFIN_PASSWORD:
+        warn("Jellyseerr: needs JELLYFIN_ADMIN_USER/PASSWORD in .env, skipping")
+        _manual.append("Jellyseerr: run its wizard at http://localhost:5055 (signs in with Jellyfin)")
+        return
+
+    s = requests.Session()
+
+    try:
+        public = s.get(f"{JELLYSEERR_URL}/api/v1/settings/public", timeout=30).json()
+    except requests.RequestException as e:
+        warn(f"Jellyseerr: not reachable ({e})")
+        return
+    initialized = bool(public.get("initialized"))
+
+    # Sign in. On a FRESH install this also creates the admin account and
+    # stores the Jellyfin connection. On a re-run the hostname fields must be
+    # omitted -- Jellyseerr rejects them outright once configured with
+    # "Jellyfin hostname already configured", which would fail the whole step.
+    payload: dict = {"username": JELLYFIN_USER, "password": JELLYFIN_PASSWORD}
+    if not initialized:
+        payload.update(
+            {
+                "hostname": "jellyfin",  # bare host + port, NOT a URL
+                "port": 8096,
+                "useSsl": False,
+                "urlBase": "",
+                "serverType": 2,  # MediaServerType.JELLYFIN
+            }
+        )
+        if JELLYSEERR_EMAIL:
+            payload["email"] = JELLYSEERR_EMAIL
+    try:
+        r = s.post(f"{JELLYSEERR_URL}/api/v1/auth/jellyfin", json=payload, timeout=60)
+        r.raise_for_status()
+        ok("Jellyseerr: signed in with Jellyfin" if initialized else "Jellyseerr: admin account created")
+    except requests.RequestException as e:
+        detail = getattr(e.response, "text", "")[:200] if getattr(e, "response", None) is not None else e
+        warn(f"Jellyseerr: could not sign in -- {detail}")
+        _manual.append("Jellyseerr: finish its wizard by hand at http://localhost:5055")
+        return
+
+    # Libraries. Enabling them is what makes titles show as already-available
+    # instead of requestable.
+    #
+    # ⚠ /settings/jellyfin/library REWRITES every library's enabled flag from
+    # its `enable` query param on EVERY call -- so hitting it without that
+    # param (to sync, or just to look) silently DISABLES everything. Never
+    # call it to read. Read the state from /settings/jellyfin instead, and
+    # always pass sync and enable together in one shot.
+    try:
+        current = s.get(f"{JELLYSEERR_URL}/api/v1/settings/jellyfin", timeout=30).json().get("libraries", [])
+        if current and all(lib.get("enabled") for lib in current):
+            skip(f"Jellyseerr: {len(current)} librar{'y' if len(current) == 1 else 'ies'} already enabled")
+        else:
+            found = s.get(
+                f"{JELLYSEERR_URL}/api/v1/settings/jellyfin/library",
+                params={"sync": "true", "enable": ",".join(lib["id"] for lib in current)} if current else {"sync": "true"},
+                timeout=60,
+            ).json()
+            if not found:
+                warn("Jellyseerr: Jellyfin reported no libraries -- create them there first")
+            else:
+                libs = s.get(
+                    f"{JELLYSEERR_URL}/api/v1/settings/jellyfin/library",
+                    params={"enable": ",".join(lib["id"] for lib in found)},
+                    timeout=60,
+                ).json()
+                ok(f"Jellyseerr: enabled {len(libs)} librar{'y' if len(libs) == 1 else 'ies'}")
+    except requests.RequestException as e:
+        warn(f"Jellyseerr: could not sync libraries ({e})")
+
+    # Sonarr / Radarr. The /test endpoint doubles as the only way to read an
+    # app's quality profiles and root folders through Jellyseerr.
+    targets = (
+        ("radarr", "Radarr", radarr_key, 7878, f"{MEDIA_ROOT_IN_CONTAINER}/library/movies"),
+        ("sonarr", "Sonarr", sonarr_key, 8989, f"{MEDIA_ROOT_IN_CONTAINER}/library/tv"),
+    )
+    for slug, label, key, port, want_dir in targets:
+        if not key:
+            warn(f"Jellyseerr: no {label} API key, skipping")
+            continue
+        try:
+            existing = s.get(f"{JELLYSEERR_URL}/api/v1/settings/{slug}", timeout=30).json()
+            if existing:
+                skip(f"Jellyseerr: {label} already connected")
+                continue
+
+            conn = {"hostname": slug, "port": port, "apiKey": key, "useSsl": False, "baseUrl": ""}
+            probe = s.post(f"{JELLYSEERR_URL}/api/v1/settings/{slug}/test", json=conn, timeout=60)
+            probe.raise_for_status()
+            probe = probe.json()
+
+            profiles = probe.get("profiles", [])
+            roots = [r["path"] for r in probe.get("rootFolders", [])]
+            if not profiles or not roots:
+                warn(f"Jellyseerr: {label} returned no profiles/root folders")
+                continue
+
+            # Prefer the configured name, then anything but "Any" -- which
+            # despite the name EXCLUDES 4K and traps people (see README).
+            chosen = next((p for p in profiles if p["name"] == JELLYSEERR_PROFILE), None)
+            if chosen is None:
+                chosen = next((p for p in profiles if p["name"].lower() != "any"), profiles[0])
+                info(f"({label}: '{JELLYSEERR_PROFILE}' not found, using '{chosen['name']}')")
+            root = want_dir if want_dir in roots else roots[0]
+
+            body = {
+                **conn,
+                "name": label,
+                "activeProfileId": chosen["id"],
+                "activeProfileName": chosen["name"],
+                "activeDirectory": root,
+                "is4k": False,
+                "isDefault": True,
+                "externalUrl": "",
+                "syncEnabled": True,
+                "preventSearch": False,
+                "tagRequests": False,
+            }
+            if slug == "radarr":
+                body["minimumAvailability"] = "released"
+            else:
+                body["enableSeasonFolders"] = True
+
+            s.post(f"{JELLYSEERR_URL}/api/v1/settings/{slug}", json=body, timeout=60).raise_for_status()
+            ok(f"Jellyseerr: {label} connected -> {chosen['name']}, {root}")
+        except requests.RequestException as e:
+            detail = getattr(e.response, "text", "")[:200] if getattr(e, "response", None) is not None else e
+            warn(f"Jellyseerr: could not connect {label} -- {detail}")
+
+    if initialized:
+        skip("Jellyseerr: setup already finalized")
+    else:
+        try:
+            s.post(f"{JELLYSEERR_URL}/api/v1/settings/initialize", json={}, timeout=30).raise_for_status()
+            ok("Jellyseerr: setup complete -- http://localhost:5055")
+        except requests.RequestException as e:
+            warn(f"Jellyseerr: could not finalize setup ({e})")
+
+
 # --- main --------------------------------------------------------------------
 
 
@@ -736,6 +916,7 @@ def main() -> int:
     wait_for("Bazarr", f"{BAZARR_URL}/")
     wait_for("SABnzbd", f"{SABNZBD_URL}/")
     wait_for("Jellyfin", f"{JELLYFIN_URL}/System/Info/Public")
+    wait_for("Jellyseerr", f"{JELLYSEERR_URL}/api/v1/status")
 
     step("Reading API keys from config volumes")
     sonarr_key = read_arr_api_key("/keys/sonarr/config.xml", "Sonarr")
@@ -769,6 +950,7 @@ def main() -> int:
     configure_sabnzbd(sab_key)
     configure_bazarr(bazarr_key, sonarr_key or "", radarr_key or "")
     configure_jellyfin()
+    configure_jellyseerr(sonarr_key or "", radarr_key or "")
 
     print("\n" + "=" * 70)
     if _problems:

@@ -7,6 +7,7 @@ subtitles, and it appears in Jellyfin ready to watch.
 | Service               | Role                                                                               | URL                                                 |
 | --------------------- | ---------------------------------------------------------------------------------- | --------------------------------------------------- |
 | **Jellyfin**    | Watch your library                                                                 | [http://localhost:8096](http://localhost:8096)       |
+| **Jellyseerr**  | Request page — other people ask for films/shows here, no Radarr/Sonarr login needed | [http://localhost:5055](http://localhost:5055)       |
 | **Radarr**      | Movies: wanted list, quality rules, imports                                        | [http://localhost:7878](http://localhost:7878)       |
 | **Sonarr**      | TV: same, plus auto-grabs new episodes                                             | [http://localhost:8989](http://localhost:8989)       |
 | **Prowlarr**    | Indexer manager — configure search sites once                                     | [http://localhost:9696](http://localhost:9696)       |
@@ -17,15 +18,19 @@ subtitles, and it appears in Jellyfin ready to watch.
 | Byparr                | Anti-bot browser proxy — outside this guide's scope, not wired into Prowlarr here | —                                                  |
 | Recyclarr             | Syncs TRaSH Guides quality profiles into Sonarr/Radarr (scheduled, not a live UI)  | —                                                  |
 
-Everything except Jellyfin binds to `127.0.0.1` — admin UIs are not exposed to
-your network. Jellyfin listens on all interfaces so phones and TVs can reach it.
+Everything except Jellyfin binds to `127.0.0.1` by default — admin UIs are not
+exposed to your network. Jellyfin listens on all interfaces so phones and TVs
+can reach it. On a **headless** server that default makes every UI unreachable;
+set `BIND_ADDRESS=0.0.0.0` in `.env` to put them on your LAN — see
+[Reaching the web UIs from another machine](#reaching-the-web-uis-from-another-machine).
 
 **Designed for:** Windows + Docker Desktop (WSL2). Works on Linux with two small
-changes noted in [Running on Linux](#running-on-linux).
+changes noted in [Running on Linux](#running-on-linux), and on Proxmox — see
+[docs/PROXMOX.md](docs/PROXMOX.md).
 
 > ### 👉 Setting this up for the first time?
 >
-> **Read [ONE-TIME-SETUP.md](ONE-TIME-SETUP.md) instead.** It's a short,
+> **Read [ONE-TIME-SETUP.md](docs/ONE-TIME-SETUP.md) instead.** It's a short,
 > copy-paste checklist that gets you running in ~20 minutes.
 >
 > This README is the **reference manual** — it explains every decision, documents
@@ -98,7 +103,7 @@ structural — not a setting that can be forgotten.
 # QUICK START
 
 > For a shorter, action-only version of this section, use
-> **[ONE-TIME-SETUP.md](ONE-TIME-SETUP.md)**. What follows is the same process
+> **[ONE-TIME-SETUP.md](docs/ONE-TIME-SETUP.md)**. What follows is the same process
 > with the reasoning included.
 
 Steps 1–6 get the stack running (~15 min), then **step 7 runs one command
@@ -113,8 +118,12 @@ you (indexers, Usenet provider, subtitle languages).
   [most providers](https://github.com/qdm12/gluetun-wiki); see
   [Using a different VPN provider](#using-a-different-vpn-provider)
 - **Disk space** on a single drive — 4K TV seasons are 50–100 GB each
-- **Optional: an NVIDIA GPU** for hardware transcoding. Without one, delete the
-  `deploy:` block from the `jellyfin` service or that container will not start
+- **Optional: an NVIDIA, AMD, or Intel GPU** for hardware transcoding. NVIDIA
+  works out of the box; AMD/Intel need `docker-compose.gpu-amd.yml` layered on
+  top — see [Using an AMD or Intel GPU instead of
+  NVIDIA](#using-an-amd-or-intel-gpu-instead-of-nvidia). No GPU at all? Delete
+  the `deploy:` block from the `jellyfin` service or that container will not
+  start
 - **Optional: a Usenet subscription** — a provider (~€3–10/mo) *and* an indexer
   (~€10–15/yr). Without both, skip SABnzbd and use torrents only
 
@@ -132,7 +141,9 @@ you (indexers, Usenet provider, subtitle languages).
 | `scripts\check-vpn.ps1` / `scripts/check-vpn.sh`   | Leak test + kill-switch test. Run before downloading. Windows/Linux, identical behavior                                                                                     |
 | `scripts\vpn-toggle.ps1` / `scripts/vpn-toggle.sh` | Pause/resume the tunnel. Windows/Linux, identical behavior                                                                                                                  |
 | `scripts\speedtest.ps1` / `scripts/speedtest.sh`   | Direct vs tunnelled throughput. Windows/Linux, identical behavior                                                                                                           |
-| `docker-compose.novpn.yml`                           | ⚠ Full stack, no VPN — an alternative to`docker-compose.yml`, not an addition. See [ONE-TIME-SETUP.md](ONE-TIME-SETUP.md#optional-running-the-whole-stack-without-a-vpn) |
+| `docker-compose.novpn.yml`                           | ⚠ Full stack, no VPN — an alternative to`docker-compose.yml`, not an addition. See [ONE-TIME-SETUP.md](docs/ONE-TIME-SETUP.md#optional-running-the-whole-stack-without-a-vpn) |
+| `docker-compose.gpu-amd.yml`                         | Override, layered with `-f` on top of either compose file above — VAAPI for AMD/Intel GPUs instead of NVIDIA/NVENC. See [Using an AMD or Intel GPU instead of NVIDIA](#using-an-amd-or-intel-gpu-instead-of-nvidia) |
+| `docs/PROXMOX.md`                                    | Full runbook for a headless Proxmox box — bare metal → LXC → this stack, with VAAPI transcoding                                                                             |
 | `.gitignore`                                         | Keeps both secret files out of commits                                                                                                                                      |
 | `setup/configure.py`                                 | One-shot API-based configurator —`docker compose run --rm setup`. Idempotent                                                                                             |
 | `recyclarr-config/recyclarr.yml`                     | Quality profile sync config for Sonarr/Radarr.**Contains API keys** — same secret status as `.env`                                                                 |
@@ -254,7 +265,10 @@ docker compose run --rm setup
 This does **everything** in steps 8–13 below — download clients, root folders,
 quality caps, seeder minimums, Prowlarr↔Sonarr/Radarr links, SABnzbd
 categories and whitelist, Bazarr connections, the Jellyfin wizard, libraries,
-NVENC, and a startup trigger on Jellyfin's library scan (see
+hardware transcoding (NVENC by default, or VAAPI with `GPU_VENDOR=amd` — see
+[Using an AMD or Intel GPU instead of
+NVIDIA](#using-an-amd-or-intel-gpu-instead-of-nvidia)), and a startup trigger
+on Jellyfin's library scan (see
 [§13](#13-jellyfin--the-library)). It uses each app's own REST API (the same
 calls their web UIs make), so there is no browser automation to break when a
 UI changes.
@@ -428,7 +442,8 @@ are already done — it adds a startup trigger to the existing scan schedule and
 leaves the interval trigger in place as the backstop.
 
 If you have an NVIDIA GPU: **Dashboard → Playback → Transcoding** →
-[enable NVENC](#hardware-transcoding).
+[enable NVENC](#hardware-transcoding). AMD or Intel GPU instead? See
+[Using an AMD or Intel GPU instead of NVIDIA](#using-an-amd-or-intel-gpu-instead-of-nvidia).
 
 ## 14. Bazarr — subtitles
 
@@ -702,6 +717,41 @@ evaluates torrents in an active state (`downloading`, `stalledDL`, `metaDL`,
 outside that set — so it's skipped entirely on the next poll, with or without
 this redesign.
 
+#### It also unsticks indexers
+
+A second, unrelated job living in the same container, because it's the same
+shape of problem: something that looks fine but has quietly stopped working.
+
+**Sonarr and Radarr keep their own indexer failure backoff, separate from
+Prowlarr's.** When a tracker fails a few times — a Cloudflare challenge that
+timed out, a site having a bad hour — the *arr* app parks it. That's sensible.
+What isn't: the backoff doesn't reliably clear once the tracker recovers, and
+a parked indexer is simply skipped during searches.
+
+The symptom is nasty because it looks like nothing is wrong:
+
+```
+[Info] ReleaseSearchService: Searching indexers for [Some Movie]. 0 active indexers
+[Info] DownloadDecisionMaker: No results found
+```
+
+From Jellyseerr or the Radarr UI that's indistinguishable from "no releases
+exist for this" — the request just sits at Processing forever. This actually
+happened here: every indexer was parked while Prowlarr could search the very
+same trackers successfully on demand.
+
+Every `INDEXER_CHECK_INTERVAL_SECONDS` (default 15 min) the monitor reads
+`GET /api/v3/health`, picks out the `IndexerStatusCheck` /
+`IndexerLongTermStatusCheck` warnings, and re-tests exactly the indexers named
+in them via `POST /api/v3/indexer/test`. A passing test clears the backoff —
+that's all the **Test** button in the UI does. Genuinely dead trackers just
+fail the test again and stay parked, which is correct.
+
+The interval is deliberately far slower than the 60-second download poll: each
+retest is a real request to a real tracker, and hammering them every minute
+would be both rude and self-defeating. Nothing is ever disabled or deleted
+here — the only action it can take is *un*-parking something.
+
 **Config** (`docker-compose.yml`, `speed-monitor` service environment):
 
 | Variable                  | Default                | Meaning                                                                    |
@@ -712,6 +762,7 @@ this redesign.
 | `PROGRESS_GUARD`        | `0.20` (20%)         | Downloads past this progress are never touched                             |
 | `MAX_RETRIES`           | `2`                  | Stopped attempts allowed before picking the best and giving up on the rest |
 | `POLL_INTERVAL_SECONDS` | `60`                 | How often it checks                                                        |
+| `INDEXER_CHECK_INTERVAL_SECONDS` | `900` (15 min) | How often to re-test indexers stuck in Sonarr/Radarr's backoff. Each retest hits a real tracker — don't lower this much |
 
 **Watch it work:**
 
@@ -939,7 +990,7 @@ the exit IP changes between reconnects.
 
 ### 3. Running the whole stack with no VPN
 
-Full setup: [ONE-TIME-SETUP.md](ONE-TIME-SETUP.md#optional-running-the-whole-stack-without-a-vpn).
+Full setup: [ONE-TIME-SETUP.md](docs/ONE-TIME-SETUP.md#optional-running-the-whole-stack-without-a-vpn).
 `docker-compose.novpn.yml` is an **alternative** to the protected stack, not a
 second instance alongside it — same project, same container names, same
 ports, same volumes, minus gluetun:
@@ -1028,6 +1079,18 @@ nothing exposed to the public internet.**
 4. Find this machine's address: `tailscale ip -4` (a `100.x.y.z`)
 5. Browse to `http://100.x.y.z:8096`
 
+This covers the **whole stack**, not just Jellyfin — Jellyseerr at
+`:5055`, Radarr at `:7878`, and so on are all reachable at the same address
+once `BIND_ADDRESS` lets them off loopback.
+
+> **Install it on the host, not as a Docker service.** The gluetun pattern
+> (`network_mode: service:tailscale`) can't work here: a container lives in
+> exactly one network namespace, and qBittorrent, Prowlarr, and Byparr are
+> already in gluetun's — you'd be choosing between the VPN and the tailnet for
+> precisely the containers that need the VPN. A host-level install gives every
+> service a tailnet address with no compose changes at all. On Proxmox, "the
+> host" means inside the LXC — see [docs/PROXMOX.md](docs/PROXMOX.md#11-optional-tailscale-for-access-from-outside-the-house).
+
 For Jellyfin to accept those clients, add `100.64.0.0/10` to
 **Dashboard → Networking → LAN Networks**.
 
@@ -1045,6 +1108,93 @@ tailscale serve --bg 8096
 
 > Do **not** use `tailscale funnel` unless you mean it — that publishes the
 > service to the entire internet, which is exactly what this avoids.
+
+## Reaching the web UIs from another machine
+
+By default every admin UI binds to `127.0.0.1` — reachable only from the
+machine running Docker. That's the right default when you sit at that machine,
+and the wrong one on a **headless server** (a Proxmox LXC, a NAS, a mini PC in
+a cupboard), where it means you cannot open any of them at all.
+
+One line in `.env` changes it:
+
+```ini
+BIND_ADDRESS=0.0.0.0
+```
+
+Then `docker compose up -d` to re-apply. Every UI becomes reachable at
+`http://<server-ip>:<port>` from any device on your network.
+
+Two ports deliberately ignore this variable:
+
+- **Jellyfin (8096)** is always on all interfaces — phones and TVs need it.
+- **gluetun's control API (8010)** always stays on localhost. It's an admin
+  endpoint that can move the VPN tunnel, not a UI.
+
+⚠ **What you're accepting.** `0.0.0.0` puts these on your LAN with nothing in
+front of them — and Sonarr, Radarr, and Prowlarr ship with **no login at all**
+by default, so anyone on your network can open them and change anything.
+That's usually fine on a home LAN you control. It is not fine on shared or
+public Wi-Fi, and you should **never port-forward these from your router** —
+that publishes them to the internet. If you want access from outside your
+home, use [Tailscale](#remote-access-to-jellyfin) instead, which needs no
+open ports.
+
+## Jellyseerr — requests
+
+Jellyseerr ([http://localhost:5055](http://localhost:5055)) is the front door
+for everyone who isn't you. Instead of handing family members a Radarr login,
+they search a clean Netflix-style catalogue and click **Request**. Approved
+requests go straight into Radarr/Sonarr and download normally.
+
+`docker compose run --rm setup` configures it completely, provided
+`JELLYFIN_ADMIN_USER` / `JELLYFIN_ADMIN_PASSWORD` are in `.env`. It creates the
+admin account (the same Jellyfin credentials log you in), enables both
+libraries, and registers Sonarr and Radarr as request targets. Open
+[http://localhost:5055](http://localhost:5055) and sign in — nothing to fill in.
+
+The quality profile it requests at defaults to `HD-1080p`. Change it with:
+
+```ini
+JELLYSEERR_QUALITY_PROFILE=Ultra-HD
+```
+
+It must be a profile name that exists in Sonarr/Radarr (**Settings → Profiles**);
+if it doesn't, the script falls back to the first profile that isn't "Any" and
+says so. "Any" is deliberately never chosen — despite the name it
+[excludes 4K](#quality-profiles-the-any-trap).
+
+The one thing left to you is **Settings → Users** to invite people. Requests
+from non-admin users need your approval by default (**Settings → Users →
+Permissions** to change that).
+
+### How it fits together
+
+Jellyseerr doesn't download anything itself. It's a catalogue and an approval
+queue in front of the machinery you already have:
+
+1. Someone searches (TMDB metadata) and clicks **Request**
+2. You approve it (or it's auto-approved, for users you trust)
+3. Jellyseerr adds it to **Radarr** or **Sonarr** with the quality profile and
+   root folder configured above — exactly as if you'd added it yourself
+4. From there it's the normal pipeline: Prowlarr searches your indexers,
+   qBittorrent/SABnzbd downloads it, Radarr/Sonarr import and rename it
+5. Jellyseerr watches Jellyfin's libraries, so once it's imported the request
+   flips to **Available** and the requester gets notified
+
+It only talks to Jellyfin, Sonarr, Radarr, and TMDB — never to an indexer or a
+torrent swarm — so like Sonarr and Radarr it is deliberately **not** routed
+through the VPN.
+
+### Watch out for
+
+Jellyseerr's `/settings/jellyfin/library` endpoint **rewrites every library's
+enabled flag on every call**, from its `enable` query parameter. Calling it
+without that parameter — even just to look — silently disables all of them,
+and requests then show everything as missing. The setup script reads library
+state from `/settings/jellyfin` instead and only ever hits the library endpoint
+with `sync` and `enable` together. Worth knowing if you script against it
+yourself.
 
 ## Hardware transcoding
 
@@ -1066,7 +1216,74 @@ docker exec jellyfin nvidia-smi --query-gpu=name --format=csv,noheader
 ```
 
 No NVIDIA GPU? Delete the `deploy:` block from the `jellyfin` service or the
-container will not start.
+container will not start — or see the next section if you have an AMD or
+Intel GPU instead.
+
+## Using an AMD or Intel GPU instead of NVIDIA
+
+`docker-compose.yml` assumes NVIDIA/NVENC by default, but that's not a hard
+requirement — AMD and Intel integrated graphics (VAAPI) work too, which
+matters most for mini PCs and NUCs that have no discrete GPU at all. One
+`.env` line, plus one extra compose file:
+
+```ini
+GPU_VENDOR=amd
+```
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.gpu-amd.yml up -d
+```
+
+Tired of typing `-f` on every command? Put this in `.env` instead and every
+plain `docker compose` command picks up both files:
+
+```ini
+COMPOSE_PATH_SEPARATOR=:
+COMPOSE_FILE=docker-compose.yml:docker-compose.gpu-amd.yml
+```
+
+(`COMPOSE_PATH_SEPARATOR` is what makes the `:` form work on Windows too —
+without it Windows expects `;`. Setting both keeps one portable `.env`.)
+
+Nothing needs editing in the base file: `docker-compose.gpu-amd.yml` uses
+Compose's `!reset` tag to delete the inherited NVIDIA block, then adds the
+VAAPI device. It works the same way on top of `docker-compose.novpn.yml`.
+
+### Why this needs a separate file, and not just a second `deploy:` entry
+
+Reasonable question, and the answer is that these are **two structurally
+different Docker features** — not two values of the same setting:
+
+| | NVENC | VAAPI |
+| --- | --- | --- |
+| Compose key | `deploy.resources.reservations.devices` | top-level `devices:` |
+| What it is | A request to a **device driver plugin** — `driver: nvidia` resolves to the NVIDIA Container Toolkit, which Docker must have registered | An ordinary **device bind-mount** of a kernel device node (`/dev/dri`) |
+| Needs a plugin? | Yes | No — there is no VAAPI plugin, and none is needed |
+
+So VAAPI would never live under `deploy:` even if both were in one file — it
+isn't that kind of thing. And they can't both be active at once anyway: the
+NVIDIA reservation *hard-fails* on a machine with no NVIDIA runtime
+(`could not select device driver "nvidia"`). Compose's `-f` layering is the
+only conditional mechanism available, which is why it's a separate file.
+
+### The rest
+
+`GPU_VENDOR=amd` tells `docker compose run --rm setup` to configure Jellyfin
+for VAAPI instead of NVENC (**Dashboard → Playback → Transcoding** → hardware
+acceleration: **VAAPI**). `GPU_VENDOR=none` leaves hardware transcoding off
+entirely.
+
+⚠ **Tone mapping is deliberately left off on VAAPI.** It needs an OpenCL
+runtime inside the container, and on AMD a missing one makes HDR transcodes
+*fail* rather than fall back to CPU. Enable it by hand (**Dashboard → Playback
+→ Enable Tone mapping**) once you've confirmed 4K HDR actually plays on your
+hardware. On NVENC it's enabled automatically, where that path is reliable.
+
+The GPU driver must be installed wherever Docker **actually runs** (e.g.
+`apt install mesa-va-drivers` on Debian/Ubuntu) — inside the VM if you use
+one, or on the Proxmox host itself if Docker runs in an LXC. See
+[docs/PROXMOX.md](docs/PROXMOX.md) for that walkthrough, including the
+`/dev/dri` group-ownership trap that silently drops you back to CPU.
 
 ## Running on Linux
 
@@ -1178,6 +1395,7 @@ narrows the field fast.
 | SABnzbd download client fails with`401`/`Access denied`      | Add`sabnzbd` to SABnzbd's Host whitelist — see step 9                                          |
 | Imports are slow / disk fills up                                 | Hardlinks are failing. Confirm downloads and library are under the same`MEDIA_ROOT`             |
 | Nothing is found for anything                                    | No indexers configured, or they didn't sync. Prowlarr →**Sync App Indexers**               |
+| Searches find nothing, but Prowlarr's own test search works      | Indexers parked in Sonarr/Radarr's separate backoff. Check `docker logs radarr \| grep "active indexers"` — speed-monitor clears these every 15 min, or click **Test** on each in **Settings → Indexers** |
 
 ## Jellyfin
 
@@ -1187,10 +1405,10 @@ narrows the field fast.
 | Library is empty                              | Files only appear after Sonarr/Radarr*import* them into `/data/library`. Raw downloads are not in the library                                             |
 | Nothing appears after a download              | **Dashboard → Scheduled Tasks → Scan Media Library**. If that finds it, real-time monitoring missed the event                                         |
 | Write/permission errors on scan               | Untick*Save artwork into media folders* and *Save metadata as NFO* — `/media` is read-only by design                                                   |
-| Container won't start                         | Almost always the GPU`deploy:` block on a machine without NVIDIA                                                                                            |
+| Container won't start                         | Almost always the GPU`deploy:` block on a machine without NVIDIA — delete it, or switch to [`docker-compose.gpu-amd.yml`](#using-an-amd-or-intel-gpu-instead-of-nvidia) if you have an AMD/Intel GPU instead |
 | Can't identify a movie                        | Rename the folder to`Movie Name (Year)`, or use *Identify*                                                                                                |
 | 4K HDR looks washed out                       | Tick*Enable Tone mapping* under Dashboard → Playback                                                                                                       |
-| Playback stutters on 4K                       | Enable NVENC, or use a client that direct-plays HEVC                                                                                                          |
+| Playback stutters on 4K                       | Enable NVENC/VAAPI, or use a client that direct-plays HEVC                                                                                                    |
 | Forgot the admin password                     | No fallback — recovery means editing the database, or`docker volume rm downloader_jellyfin-config` and redoing the wizard (loses watch history, not media) |
 
 ### Jellyfin shows several servers and none work
