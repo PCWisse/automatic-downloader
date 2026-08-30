@@ -11,10 +11,10 @@ services:
       - /dev/net/tun:/dev/net/tun
     ports:
       # Ports for qbittorrent/prowlarr go HERE (shared namespace), not on those services.
-      - 127.0.0.1:8090:8090 # qBittorrent WebUI  -> must match WEBUI_PORT below
+      - ${BIND_ADDRESS:-127.0.0.1}:8090:8090 # qBittorrent WebUI  -> must match WEBUI_PORT below
       - 127.0.0.1:8010:8010 # gluetun control API -> must match HTTP_CONTROL_SERVER_ADDRESS below
-      - 127.0.0.1:9696:9696 # Prowlarr WebUI
-      - 127.0.0.1:8191:8191 # Byparr
+      - ${BIND_ADDRESS:-127.0.0.1}:9696:9696 # Prowlarr WebUI
+      - ${BIND_ADDRESS:-127.0.0.1}:8191:8191 # Byparr
     volumes:
       - gluetun-config:/gluetun
       - ./gluetun-auth.toml:/gluetun/auth/config.toml:ro
@@ -92,14 +92,14 @@ services:
     # Only expose the port if you need host access / debugging.
     # # Inside the compose network Prowlarr can reach it as http://byparr:8191
     # ports:
-    #   - 127.0.0.1:8191:8191
+    #   - ${BIND_ADDRESS:-127.0.0.1}:8191:8191
     restart: unless-stopped  
 
   sonarr:
     image: lscr.io/linuxserver/sonarr:latest
     container_name: sonarr
     ports:
-      - 127.0.0.1:8989:8989
+      - ${BIND_ADDRESS:-127.0.0.1}:8989:8989
     environment:
       - PUID=1000
       - PGID=1000
@@ -113,7 +113,7 @@ services:
     image: lscr.io/linuxserver/radarr:latest
     container_name: radarr
     ports:
-      - 127.0.0.1:7878:7878
+      - ${BIND_ADDRESS:-127.0.0.1}:7878:7878
     environment:
       - PUID=1000
       - PGID=1000
@@ -127,7 +127,7 @@ services:
     image: lscr.io/linuxserver/bazarr:latest
     container_name: bazarr
     ports:
-      - 127.0.0.1:6767:6767
+      - ${BIND_ADDRESS:-127.0.0.1}:6767:6767
     environment:
       - PUID=1000
       - PGID=1000
@@ -141,7 +141,7 @@ services:
     image: lscr.io/linuxserver/sabnzbd:latest
     container_name: sabnzbd
     ports:
-      - 127.0.0.1:8080:8080
+      - ${BIND_ADDRESS:-127.0.0.1}:8080:8080
     environment:
       - PUID=1000
       - PGID=1000
@@ -166,7 +166,11 @@ services:
       - jellyfin-config:/config
       - jellyfin-cache:/cache
       - ${MEDIA_ROOT}/library:/media:ro
-    # No NVIDIA GPU? Delete this deploy: block or the container won't start.
+    # NVIDIA GPU assumed by default. AMD/Intel iGPU (VAAPI)? Layer
+    # docker-compose.gpu-amd.yml on top -- it removes this block for you, no
+    # editing needed. See README's "Using an AMD or Intel GPU instead of
+    # NVIDIA". No GPU at all? Delete this deploy: block, or the container
+    # won't start.
     deploy:
       resources:
         reservations:
@@ -177,38 +181,24 @@ services:
     restart: unless-stopped
 
 
-  # First-time setup (web UI)
-  # Open: http://127.0.0.1:5055
-  
-  # Sign in with Jellyfin
-  # Jellyfin URL: http://jellyfin:8096
-  # (or http://127.0.0.1:8096 if the container name doesn’t resolve)
-  # Use an admin Jellyfin account
-  
-  # Connect Sonarr
-  # URL: http://sonarr:8989
-  # API key: from Sonarr → Settings → General
-  
-  # Connect Radarr
-  # URL: http://radarr:7878
-  # API key: from Radarr → Settings → General
-  
-  # Finish the wizard and create your Jellyseerr admin user.
-  
-  # 3. Optional but recommended tweaks
-
-  # jellyseerr:
-  #   image: fallenbagel/jellyseerr:latest
-  #   container_name: jellyseerr
-  #   environment:
-  #     - LOG_LEVEL=info
-  #     - TZ=${TZ:-Etc/UTC}
-  #     - PORT=5055
-  #   ports:
-  #     - 127.0.0.1:5055:5055        # only reachable from the host
-  #   volumes:
-  #     - jellyseerr-config:/app/config
-  #   restart: unless-stopped
+  # Request frontend: people ask for a film/show here instead of being given
+  # Radarr/Sonarr logins. Approved requests are handed straight to them.
+  # Not VPN-routed -- it only talks to Jellyfin/Sonarr/Radarr and TMDB, never
+  # to a torrent swarm or an indexer. Same reasoning as Sonarr/Radarr.
+  # Its wizard is the one part of the stack the setup script does not automate
+  # -- see README's "Jellyseerr -- requests".
+  jellyseerr:
+    image: fallenbagel/jellyseerr:latest
+    container_name: jellyseerr
+    ports:
+      - ${BIND_ADDRESS:-127.0.0.1}:5055:5055
+    environment:
+      - LOG_LEVEL=info
+      - TZ=${TZ:-Etc/UTC}
+      - PORT=5055
+    volumes:
+      - jellyseerr-config:/app/config
+    restart: unless-stopped
 
   recyclarr:
     image: ghcr.io/recyclarr/recyclarr:8
@@ -247,6 +237,10 @@ services:
       # got furthest is resumed as the final answer; the rest stay stopped.
       - MAX_RETRIES=2
       - PROGRESS_GUARD=0.20                    # never touch a download past 20% progress
+      # How often to re-test indexers stuck in Sonarr/Radarr's failure backoff.
+      # Much slower than the download poll above -- each retest hits a real
+      # tracker. See "Indexers stuck in backoff" in the README.
+      - INDEXER_CHECK_INTERVAL_SECONDS=900     # 15 minutes
     command: sh -c "pip install --no-cache-dir requests --quiet && python monitor.py"
     restart: unless-stopped
 
@@ -276,6 +270,15 @@ services:
       - QBITTORRENT_PASSWORD=${QBITTORRENT_PASSWORD:-}
       - JELLYFIN_ADMIN_USER=${JELLYFIN_ADMIN_USER:-}
       - JELLYFIN_ADMIN_PASSWORD=${JELLYFIN_ADMIN_PASSWORD:-}
+      # nvidia (default), amd, or none -- picks NVENC vs VAAPI vs no hardware
+      # transcoding when the setup script configures Jellyfin's encoding.
+      # Must match whichever compose file(s) you launched with -- see
+      # README's "Using an AMD or Intel GPU instead of NVIDIA".
+      - GPU_VENDOR=${GPU_VENDOR:-nvidia}
+      # Quality profile Jellyseerr requests at, and the optional email for the
+      # admin account it creates. See README's "Jellyseerr -- requests".
+      - JELLYSEERR_QUALITY_PROFILE=${JELLYSEERR_QUALITY_PROFILE:-HD-1080p}
+      - JELLYSEERR_ADMIN_EMAIL=${JELLYSEERR_ADMIN_EMAIL:-}
       # Same values documented in the README; change here to change both.
       - QBIT_MAX_ACTIVE_DOWNLOADS=4
       - QBIT_SEED_RATIO_LIMIT=1.0
@@ -294,3 +297,4 @@ volumes:
   sabnzbd-config:
   jellyfin-config:
   jellyfin-cache:
+  jellyseerr-config:

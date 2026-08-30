@@ -1,0 +1,68 @@
+# ===========================================================================
+#  AMD / INTEL INTEGRATED GPU OVERRIDE (VAAPI)
+# ===========================================================================
+#
+#  docker-compose.yml assumes an NVIDIA GPU for Jellyfin hardware transcoding.
+#  Layer this file on top with -f to use VAAPI instead -- the standard path
+#  for AMD and Intel integrated graphics (a mini PC's Ryzen/Vega iGPU, an
+#  Intel NUC, etc.), where there is no discrete card at all:
+#
+#      docker compose -f docker-compose.yml -f docker-compose.gpu-amd.yml up -d
+#
+#  Works the same way on top of docker-compose.novpn.yml. If you always want
+#  it, set COMPOSE_FILE in .env instead and every plain `docker compose`
+#  command picks it up with no -f flags -- see .env.example section 5.
+#
+#  Also set GPU_VENDOR=amd in .env, so `run --rm setup` configures Jellyfin's
+#  encoding for VAAPI rather than NVENC. This file only handles the container;
+#  that variable handles the app's own settings.
+#
+#  ---------------------------------------------------------------------------
+#  WHY A SEPARATE FILE, AND NOT A SECOND deploy: BLOCK
+#  ---------------------------------------------------------------------------
+#  These are two structurally different Docker features, not two values of one
+#  setting:
+#
+#    NVENC  ->  deploy.resources.reservations.devices with driver: nvidia.
+#               That is a request to a DEVICE DRIVER PLUGIN -- the NVIDIA
+#               Container Toolkit registers one with Docker. No such plugin
+#               exists for VAAPI.
+#
+#    VAAPI  ->  the top-level devices: key. AMD/Intel expose the GPU as an
+#               ordinary kernel device node (/dev/dri), so it is a plain
+#               device bind-mount. It would never live under deploy:.
+#
+#  They also cannot both be active at once: the nvidia reservation hard-fails
+#  on a machine with no NVIDIA runtime ("could not select device driver").
+#  Compose's -f layering is the only conditional mechanism available, which is
+#  why this is a separate file rather than a block in the main one.
+#
+#  `deploy: !reset null` below deletes the inherited nvidia block outright
+#  (Compose v2.24+). Nothing needs editing in the base file.
+#
+#  ---------------------------------------------------------------------------
+#  REQUIREMENTS ON THE HOST
+#  ---------------------------------------------------------------------------
+#  The GPU driver must be installed wherever Docker ACTUALLY runs -- inside
+#  the VM if you use one, or on the Proxmox host itself if you run Docker in
+#  an LXC (e.g. `apt install mesa-va-drivers` on Debian/Ubuntu).
+#
+#  In an LXC, /dev/dri's group ownership comes from the HOST's numeric GID and
+#  often does not match the container's own render/video group -- Jellyfin
+#  then cannot open the device and silently falls back to CPU. Check with:
+#
+#      docker exec jellyfin ls -ln /dev/dri
+#
+#  and if the GID shown does not match, add it to the jellyfin service:
+#
+#      group_add:
+#        - "993"      # whatever numeric GID that command printed
+#
+#  See docs/PROXMOX.md for the full walkthrough.
+# ===========================================================================
+
+services:
+  jellyfin:
+    deploy: !reset null
+    devices:
+      - /dev/dri:/dev/dri

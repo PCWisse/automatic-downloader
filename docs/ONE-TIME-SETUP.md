@@ -4,11 +4,15 @@ Follow this once, top to bottom. **~20 minutes**, most of it waiting for
 containers to start.
 
 This is the *do this* guide. It deliberately does not explain why — for that,
-read [README.md](README.md), which documents every decision in the stack.
+read [README.md](../README.md), which documents every decision in the stack.
 
 **What you get at the end:** you add a movie or show to a list, and it gets
 found, downloaded over a VPN, renamed, filed, given subtitles, and shows up in
 Jellyfin ready to watch. No manual steps per download.
+
+> **Installing on Proxmox?** Follow [PROXMOX.md](PROXMOX.md)
+> instead — it covers the host install, the LXC, and AMD/Intel GPU
+> transcoding, then hands back to this guide for the stack itself.
 
 > **Don't want a VPN at all?** Most of steps 1–6 below are VPN setup —
 > credentials, an API key, verifying the tunnel. None of that applies to you.
@@ -25,14 +29,18 @@ Get these ready first — the setup stops dead without them.
 | You need | Notes |
 | --- | --- |
 | **Docker Desktop** (Windows/Mac) or **Docker + Compose v2** (Linux) | Must be running before step 1 |
-| **A VPN subscription** | Not needed if you're going the [no-VPN route](#optional-running-the-whole-stack-without-a-vpn) instead. Otherwise: ships configured for [PrivadoVPN](https://privadovpn.com); free tier works (10 GB/month). Other providers need a small edit — see [Using a different VPN provider](README.md#using-a-different-vpn-provider) |
-| **Disk space on ONE drive** | 4K TV seasons run 50–100 GB. Downloads *and* library must share one drive — this is mandatory, see [why](README.md#why-everything-shares-one-mount-hardlinks) |
+| **A VPN subscription** | Not needed if you're going the [no-VPN route](#optional-running-the-whole-stack-without-a-vpn) instead. Otherwise: ships configured for [PrivadoVPN](https://privadovpn.com); free tier works (10 GB/month). Other providers need a small edit — see [Using a different VPN provider](../README.md#using-a-different-vpn-provider) |
+| **Disk space on ONE drive** | 4K TV seasons run 50–100 GB. Downloads *and* library must share one drive — this is mandatory, see [why](../README.md#why-everything-shares-one-mount-hardlinks) |
 | **At least one indexer** | A torrent tracker and/or Usenet indexer you have access to. **Nothing downloads without this** — no script can supply it |
 
 **Optional:**
 
-- **NVIDIA GPU** — for hardware transcoding. No GPU? Delete the `deploy:` block
-  from the `jellyfin` service in `docker-compose.yml`, or that container won't start.
+- **NVIDIA, AMD, or Intel GPU** — for hardware transcoding. NVIDIA works as
+  shipped. AMD/Intel need `GPU_VENDOR=amd` in `.env` plus
+  `docker-compose.gpu-amd.yml` layered on with `-f` — see
+  [README](../README.md#using-an-amd-or-intel-gpu-instead-of-nvidia). No GPU at
+  all? Delete the `deploy:` block from the `jellyfin` service in
+  `docker-compose.yml`, or that container won't start.
 - **Usenet subscription** — a provider (~€3–10/mo) *plus* an indexer (~€10–15/yr).
   You need **both** or SABnzbd does nothing. Skip it and use torrents only.
 
@@ -203,7 +211,8 @@ QBITTORRENT_PASSWORD=your-chosen-password
 restart generates a new random one** and locks you out.
 
 **Optional but recommended** — also add a Jellyfin account to `.env`, and the
-next step will set Jellyfin up completely for you:
+next step will set up Jellyfin **and Jellyseerr** completely for you (Jellyseerr
+signs in with Jellyfin, so it's the same credentials):
 
 ```ini
 JELLYFIN_ADMIN_USER=yourname
@@ -220,9 +229,10 @@ docker compose run --rm setup
 
 This configures **everything else**: download clients, folders, quality rules,
 size caps, seeder minimums, app-to-app connections, SABnzbd categories, Bazarr,
-and Jellyfin's wizard + libraries + hardware transcoding + a startup trigger on
+Jellyfin's wizard + libraries + hardware transcoding + a startup trigger on
 the library scan (so new media shows up right after a restart, not just on the
-next scheduled scan).
+next scheduled scan), and Jellyseerr's whole setup — admin account, libraries,
+and its Sonarr/Radarr connections.
 
 You'll see a list of `[ok]` and `[skip]` lines, then a summary. **Safe to re-run
 any time** — it checks what already exists and never duplicates or deletes.
@@ -260,6 +270,24 @@ nothing to configure on the first run). Takes seconds.
 
 ---
 
+## 10. Invite people to Jellyseerr
+
+Jellyseerr (<http://localhost:5055>) is the request page other people use
+instead of getting a Radarr login — they search, click **Request**, and it
+lands in Radarr/Sonarr automatically.
+
+Step 7 already set it up completely: admin account, both libraries, and the
+Sonarr/Radarr connections. **Sign in with the same Jellyfin username and
+password** — there's nothing to configure.
+
+All that's left is **Settings → Users → Invite** for anyone else who should
+use it. Their requests need your approval by default.
+
+> Requests go in at the `HD-1080p` quality profile unless you set
+> `JELLYSEERR_QUALITY_PROFILE` in `.env` (e.g. `Ultra-HD`) and re-run setup.
+
+---
+
 ## ✅ You're done
 
 Test it end to end:
@@ -277,6 +305,7 @@ When it finishes, it appears automatically in Jellyfin at <http://localhost:8096
 | Service | URL | For |
 | --- | --- | --- |
 | **Jellyfin** | <http://localhost:8096> | Watching |
+| **Jellyseerr** | <http://localhost:5055> | Requesting (see step 10) |
 | **Radarr** | <http://localhost:7878> | Movies |
 | **Sonarr** | <http://localhost:8989> | TV |
 | Prowlarr | <http://localhost:9696> | Indexers |
@@ -285,6 +314,13 @@ When it finishes, it appears automatically in Jellyfin at <http://localhost:8096
 | qBittorrent | <http://localhost:8090> | Torrents |
 
 In normal use you only touch the first three.
+
+**On a headless server?** All of these except Jellyfin bind to `127.0.0.1`, so
+none of them are reachable from another machine. Set `BIND_ADDRESS=0.0.0.0` in
+`.env` and re-run `docker compose up -d` — then use `http://<server-ip>:<port>`
+instead of `localhost`. See
+[Reaching the web UIs from another machine](../README.md#reaching-the-web-uis-from-another-machine)
+for what that exposes.
 
 ### Two things worth doing next
 
@@ -307,13 +343,13 @@ sudo ufw allow 8096/tcp
 </details>
 
 Then browse to `http://<your-lan-ip>:8096`. See
-[Jellyfin shows several servers](README.md#jellyfin-shows-several-servers-and-none-work)
+[Jellyfin shows several servers](../README.md#jellyfin-shows-several-servers-and-none-work)
 if the app finds multiple entries.
 
 **Add media in bulk** — instead of one at a time, point Radarr/Sonarr at a
 Trakt or IMDb list under **Settings → Import Lists**. Add a film to that list
 from your phone and it downloads automatically. See
-[Adding media](README.md#adding-media-you-do-not-add-things-one-at-a-time).
+[Adding media](../README.md#adding-media-you-do-not-add-things-one-at-a-time).
 
 ---
 
@@ -451,10 +487,10 @@ protected stack.
 | Searches find only 1080p | The profile is "Any", which excludes 4K despite the name. Switch to `Ultra-HD` |
 | Jellyfin library empty | Files only appear after Sonarr/Radarr *import* them. Raw downloads aren't in the library |
 | `Category does not exist` | Re-run the setup script — it creates SABnzbd's categories |
-| Jellyfin container won't start | No NVIDIA GPU. Delete the `deploy:` block from the `jellyfin` service |
+| Jellyfin container won't start | No NVIDIA GPU. Delete the `deploy:` block from the `jellyfin` service, or switch to [`docker-compose.gpu-amd.yml`](../README.md#using-an-amd-or-intel-gpu-instead-of-nvidia) if you have an AMD/Intel GPU instead |
 | Not sure if the VPN is actually protecting you right now | Run `scripts\check-vpn.ps1` / `scripts/check-vpn.sh` — it warns loudly if it detects you're running the no-VPN mode |
 
-Full troubleshooting: [README.md](README.md#troubleshooting)
+Full troubleshooting: [README.md](../README.md#troubleshooting)
 
 ---
 

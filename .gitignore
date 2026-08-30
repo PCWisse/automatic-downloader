@@ -15,4 +15,4 @@ speed-monitor/state/
 Thumbs.db
 desktop.ini
 *.swp
-setup/__pycache__/
+__pycache__/
