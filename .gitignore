@@ -3,6 +3,8 @@
 .env
 gluetun-auth.toml
 recyclarr-config/recyclarr.yml
+# `recyclarr config create` writes here instead; these hold Sonarr/Radarr API keys.
+recyclarr-config/configs/
 
 # Runtime data -- regenerated automatically, no reason to commit.
 # resources/ is Recyclarr's own 73 MB clone of the TRaSH-Guides repo;

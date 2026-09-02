@@ -229,7 +229,11 @@ services:
       - prowlarr-config:/keys/prowlarr:ro
       - bazarr-config:/keys/bazarr:ro
       - sabnzbd-config:/keys/sabnzbd:ro
+      # Read-write -- see the same line in docker-compose.yml's setup service.
+      - ./recyclarr-config:/hostcfg/recyclarr
     environment:
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
       # Real difference from docker-compose.yml's setup service: no gluetun,
       # so qBittorrent/Prowlarr are addressed by their own container names
       # directly. configure.py reads these three -- see its top for what
@@ -237,8 +241,12 @@ services:
       - QBIT_URL=http://qbittorrent:8090
       - PROWLARR_URL=http://prowlarr:9696
       - QBIT_HOST=qbittorrent
+      # No gluetun -> Byparr is its own container, not localhost to Prowlarr.
+      - BYPARR_URL=http://byparr:8191/
       - QBITTORRENT_USER=${QBITTORRENT_USER:-}
       - QBITTORRENT_PASSWORD=${QBITTORRENT_PASSWORD:-}
+      # First run only -- see docker-compose.yml's setup service.
+      - QBITTORRENT_BOOTSTRAP_PASSWORD=${QBITTORRENT_BOOTSTRAP_PASSWORD:-}
       - JELLYFIN_ADMIN_USER=${JELLYFIN_ADMIN_USER:-}
       - JELLYFIN_ADMIN_PASSWORD=${JELLYFIN_ADMIN_PASSWORD:-}
       # nvidia (default), amd, or none -- see docker-compose.yml's setup
@@ -246,6 +254,10 @@ services:
       # you launched with.
       - GPU_VENDOR=${GPU_VENDOR:-nvidia}
       - JELLYSEERR_QUALITY_PROFILE=${JELLYSEERR_QUALITY_PROFILE:-HD-1080p}
+      # Per-app overrides. Sonarr and Radarr profile names diverge once
+      # Recyclarr builds its own, so one shared name cannot match both.
+      - JELLYSEERR_SONARR_PROFILE=${JELLYSEERR_SONARR_PROFILE:-}
+      - JELLYSEERR_RADARR_PROFILE=${JELLYSEERR_RADARR_PROFILE:-}
       - JELLYSEERR_ADMIN_EMAIL=${JELLYSEERR_ADMIN_EMAIL:-}
       - QBIT_MAX_ACTIVE_DOWNLOADS=4
       - QBIT_SEED_RATIO_LIMIT=1.0
