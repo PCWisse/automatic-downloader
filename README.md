@@ -141,6 +141,8 @@ you (indexers, Usenet provider, subtitle languages).
 | `scripts\check-vpn.ps1` / `scripts/check-vpn.sh`   | Leak test + kill-switch test. Run before downloading. Windows/Linux, identical behavior                                                                                     |
 | `scripts\vpn-toggle.ps1` / `scripts/vpn-toggle.sh` | Pause/resume the tunnel. Windows/Linux, identical behavior                                                                                                                  |
 | `scripts\speedtest.ps1` / `scripts/speedtest.sh`   | Direct vs tunnelled throughput. Windows/Linux, identical behavior                                                                                                           |
+| `scripts/setup-smb.sh`                              | **Host** script — expose the library folder as a Windows SMB share for copying media in from a PC. See [Bringing in an existing library](#bringing-in-an-existing-library-from-another-pc) |
+| `scripts/prefer-english.sh`                         | **Host** script — flip Matroska track flags so English is the default audio on ITA/MULTi releases. See [Audio and subtitle language](#audio-and-subtitle-language)          |
 | `docker-compose.novpn.yml`                           | ⚠ Full stack, no VPN — an alternative to`docker-compose.yml`, not an addition. See [ONE-TIME-SETUP.md](docs/ONE-TIME-SETUP.md#optional-running-the-whole-stack-without-a-vpn) |
 | `docker-compose.gpu-amd.yml`                         | Override, layered with `-f` on top of either compose file above — VAAPI for AMD/Intel GPUs instead of NVIDIA/NVENC. See [Using an AMD or Intel GPU instead of NVIDIA](#using-an-amd-or-intel-gpu-instead-of-nvidia) |
 | `docs/PROXMOX.md`                                    | Full runbook for a headless Proxmox box — bare metal → LXC → this stack, with VAAPI transcoding                                                                             |
@@ -554,53 +556,29 @@ server; skip for solo use.
 
 If you already have a media collection on a desktop/NAS and just want to copy it
 onto the server, the simplest route is an **SMB share** — a Windows "network
-drive" backed by the server's library folder. This is a **host-side** setup, not
-part of the container stack, and `setup` does not do it (it needs a package
-install and a user account on the host).
-
-On a Debian/Ubuntu host (or a Proxmox LXC):
+drive" backed by the server's library folder. This is a **host-side** thing, not
+part of the container stack (`setup` runs in a container and can't install a
+package or add a user on the host), so it has its own script:
 
 ```bash
-# 1. Samba, plus smbclient for testing
-sudo apt install samba smbclient
-
-# 2. A user that IS uid/gid 1000 -- the same id every container runs as, so
-#    files arriving through the share are owned exactly as Jellyfin expects.
-#    'nologin' means it can serve files but cannot be used to log in.
-sudo groupadd -g 1000 media 2>/dev/null || true
-sudo useradd  -u 1000 -g 1000 -M -s /usr/sbin/nologin media 2>/dev/null || true
-
-# 3. The share definition
-sudo tee -a /etc/samba/smb.conf >/dev/null <<'EOF'
-
-[library]
-   path = /mnt/media/library
-   read only = no
-   valid users = media
-   force user = media          # everyone who connects is treated as uid 1000,
-   force group = media         # so every file lands owned 1000:1000
-   create mask = 0664
-   directory mask = 0775
-   hosts allow = 192.168.1.    # <-- YOUR LAN's prefix; nothing else can connect
-EOF
-
-# 4. A Samba password for that user (its own password store, not the system one)
-sudo smbpasswd -a media
-sudo smbpasswd -e media
-
-# 5. Start it, and on every boot
-sudo systemctl enable --now smbd
+sudo scripts/setup-smb.sh
+#   MEDIA_ROOT   read from .env, else /mnt/media   -> shares $MEDIA_ROOT/library
+#   LAN_PREFIX   auto-detected from your IP        -> e.g. 192.168.1.
 ```
 
-`MEDIA_ROOT` is `/mnt/media` in these commands — adjust if yours differs. Only
-`library/` is exposed on purpose: `torrents/` and `usenet/` next to it hold
-in-progress downloads, and a stray drag-and-drop there would corrupt a running
-transfer.
+It installs Samba, creates a `nologin` user that **is** uid/gid 1000 — the id
+every container runs as — so `force user` makes every file arriving through the
+share land owned `1000:1000`, exactly what Jellyfin expects. It prompts once for
+an SMB password. Only `$MEDIA_ROOT/library` is shared; `torrents/` and `usenet/`
+next to it hold in-progress downloads and are deliberately kept out. Safe to
+re-run. On a fresh Debian/Ubuntu host the manual equivalent is `apt install
+samba`, a `[library]` share block with `force user`, `smbpasswd -a`,
+`systemctl enable --now smbd`.
 
 **On the Windows PC:** File Explorer → *Map network drive* → `\\<server-ip>\library`,
-*Connect using different credentials*, sign in as `media`. Then copy each show
-into `tv\` as `Series Name (Year)\Season 01\…` — filenames just need an `S01E01`
-(or `1x01`) in them. Movies go in `movies\` as `Movie Name (Year)\`.
+*Connect using different credentials*, sign in as the SMB user (`media`). Then
+copy each show into `tv\` as `Series Name (Year)\Season 01\…` — filenames just
+need an `S01E01` (or `1x01`) in them. Movies go in `movies\` as `Movie Name (Year)\`.
 
 Jellyfin picks new files up on its own (real-time monitoring, set in
 [§13](#13-jellyfin--the-library)); if something is slow to appear, **Dashboard →
@@ -613,9 +591,43 @@ Two things that bite:
 - **`\\<server-ip>` won't connect** → your PC is on a different subnet than the
   server (same reason a browser can't reach the web UIs — see [Reaching the web
   UIs from another machine](#reaching-the-web-uis-from-another-machine)). Fix the
-  network, or widen `hosts allow`.
+  network, or re-run with `LAN_PREFIX=` set to your PC's subnet.
 - **Disk space** — check `df -h /mnt/media` first. The library disk is finite and
   shared with everything the *arrs download.
+
+### Audio and subtitle language
+
+Some releases — ITA, MULTi, and other non-English scene groups — ship the
+foreign dub as the **default** audio track, so Jellyfin plays it and burns in
+the matching subtitles. Two fixes, use both:
+
+**1. Jellyfin, per user** (Dashboard → Users → *user* → *Playback*, or the
+profile settings on each device):
+
+| Setting                       | Value                                             |
+| ----------------------------- | ------------------------------------------------- |
+| Audio language preference     | English                                           |
+| Play default audio track…    | **off** — otherwise the preference is ignored     |
+| Subtitle language preference  | English                                           |
+| Subtitle mode                 | *Smart* — subtitles only when the audio isn't English |
+
+This makes Jellyfin pick the English audio track even when it isn't flagged
+default. It applies everywhere and to everything, existing files included.
+
+**2. The file flags themselves** — `scripts/prefer-english.sh` (host script,
+needs `mkvtoolnix` + `ffmpeg`):
+
+```bash
+scripts/prefer-english.sh "/mnt/media/library/tv/Show Name"   # folder, recursive
+scripts/prefer-english.sh /path/to/one.mkv                     # single file
+```
+
+It rewrites only the Matroska header flags — sets the English audio track as
+default, clears any non-English forced-subtitle flag — no re-mux, no quality
+loss, instant. Files with a single audio track or no English track are left
+alone. Worth running once over anything you copy in from elsewhere; the
+occasional file where Jellyfin still guesses wrong is a one-tap fix in the
+player (it remembers your choice for the rest of that series).
 
 ## Everyday commands
 
