@@ -811,6 +811,25 @@ def configure_bazarr(bazarr_key: str | None, sonarr_key: str, radarr_key: str) -
 # --- Jellyfin ----------------------------------------------------------------
 
 
+def jellyfin_token() -> str | None:
+    """Authenticate as the .env admin and return an access token, or None."""
+    if not JELLYFIN_USER or not JELLYFIN_PASSWORD:
+        return None
+    try:
+        r = requests.post(
+            f"{JELLYFIN_URL}/Users/AuthenticateByName",
+            json={"Username": JELLYFIN_USER, "Pw": JELLYFIN_PASSWORD},
+            headers={
+                "Authorization": 'MediaBrowser Client="setup", Device="setup", DeviceId="setup", Version="1.0.0"'
+            },
+            timeout=30,
+        )
+        r.raise_for_status()
+        return r.json()["AccessToken"]
+    except (requests.RequestException, KeyError):
+        return None
+
+
 def configure_jellyfin() -> None:
     step("Jellyfin")
     try:
@@ -869,70 +888,79 @@ def configure_jellyfin() -> None:
         _manual.append("Jellyfin: add Movies (/media/movies) and Shows (/media/tv) libraries")
         return
 
-    try:
-        auth = requests.post(
-            f"{JELLYFIN_URL}/Users/AuthenticateByName",
-            json={"Username": JELLYFIN_USER, "Pw": JELLYFIN_PASSWORD},
-            headers={
-                "Authorization": 'MediaBrowser Client="setup", Device="setup", DeviceId="setup", Version="1.0.0"'
-            },
-            timeout=30,
-        )
-        auth.raise_for_status()
-        token = auth.json()["AccessToken"]
-    except requests.RequestException as e:
-        warn(f"Jellyfin: could not authenticate as '{JELLYFIN_USER}' ({e})")
+    token = jellyfin_token()
+    if token is None:
+        warn(f"Jellyfin: could not authenticate as '{JELLYFIN_USER}'")
         _manual.append("Jellyfin: check JELLYFIN_ADMIN_USER / JELLYFIN_ADMIN_PASSWORD in .env")
         return
 
     headers = {"X-Emby-Token": token}
     try:
         folders = requests.get(f"{JELLYFIN_URL}/Library/VirtualFolders", headers=headers, timeout=30).json()
-        have = {f.get("Name"): (f.get("Locations") or []) for f in folders}
+        have = {f.get("Name"): f for f in folders}
     except requests.RequestException as e:
         warn(f"Jellyfin: could not list libraries ({e})")
         return
 
+    # The options every library must carry. EnableRealtimeMonitor is the one
+    # that actually broke playback in the wild: a library created by an older
+    # setup came up with it OFF, so new episodes were only ever seen by the
+    # 12-hourly scan -- which raced Sonarr's multi-file imports and produced
+    # unplayable "Season Unknown" entries. SaveLocalMetadata must stay off
+    # because /media is read-only; writing there logs an error every scan.
+    # (EnableInternetProviders is deliberately not listed -- on Jellyfin 10.11
+    # it is a legacy derived flag that always reads back False with the modern
+    # empty TypeOptions, so asserting it would "correct" on every run. Internet
+    # metadata works regardless via the server-default fetchers.)
+    want_opts = {
+        "EnableRealtimeMonitor": True,
+        "SaveLocalMetadata": False,
+    }
+
     for name, ctype, path in (("Movies", "movies", "/media/movies"), ("Shows", "tvshows", "/media/tv")):
         try:
-            if name in have:
-                # Existing by name is NOT enough: a library can exist with no
-                # folder attached, in which case it scans nothing and stays
-                # permanently empty. Check for the path and repair if missing.
-                if path in have[name]:
-                    skip(f"Jellyfin: library '{name}' already exists -> {path}")
-                    continue
-                r = requests.post(
-                    f"{JELLYFIN_URL}/Library/VirtualFolders/Paths",
-                    headers=headers,
-                    params={"refreshLibrary": "false"},
-                    json={"Name": name, "PathInfo": {"Path": path}},
-                    timeout=60,
-                )
-                r.raise_for_status()
-                ok(f"Jellyfin: library '{name}' had no media folder, attached {path}")
+            folder = have.get(name)
+            if folder is not None:
+                locations = folder.get("Locations") or []
+                opts = folder.get("LibraryOptions") or {}
+                item_id = folder.get("ItemId")
+
+                # A library can exist with no folder attached -- it then scans
+                # nothing and stays permanently empty.
+                if path not in locations:
+                    requests.post(
+                        f"{JELLYFIN_URL}/Library/VirtualFolders/Paths",
+                        headers=headers,
+                        params={"refreshLibrary": "false"},
+                        json={"Name": name, "PathInfo": {"Path": path}},
+                        timeout=60,
+                    ).raise_for_status()
+                    ok(f"Jellyfin: library '{name}' had no media folder, attached {path}")
+
+                drift = {k: v for k, v in want_opts.items() if opts.get(k) != v}
+                if drift and item_id:
+                    merged = {**opts, **want_opts}
+                    requests.post(
+                        f"{JELLYFIN_URL}/Library/VirtualFolders/LibraryOptions",
+                        headers=headers,
+                        json={"Id": item_id, "LibraryOptions": merged},
+                        timeout=60,
+                    ).raise_for_status()
+                    ok(f"Jellyfin: library '{name}' options corrected ({', '.join(sorted(drift))})")
+                elif not drift and path in locations:
+                    skip(f"Jellyfin: library '{name}' already correct -> {path}")
                 continue
 
-            # /media is mounted read-only, so metadata/artwork must NOT be saved
-            # into the media folders -- that would log write failures every scan.
             # PathInfos MUST sit under LibraryOptions: sent at the top level
             # Jellyfin still returns 204 but silently creates an EMPTY library.
-            options = {
-                "LibraryOptions": {
-                    "EnableRealtimeMonitor": True,
-                    "SaveLocalMetadata": False,
-                    "EnableInternetProviders": True,
-                    "PathInfos": [{"Path": path}],
-                }
-            }
-            r = requests.post(
+            options = {"LibraryOptions": {**want_opts, "PathInfos": [{"Path": path}]}}
+            requests.post(
                 f"{JELLYFIN_URL}/Library/VirtualFolders",
                 headers=headers,
                 params={"name": name, "collectionType": ctype, "refreshLibrary": "true"},
                 json=options,
                 timeout=60,
-            )
-            r.raise_for_status()
+            ).raise_for_status()
             ok(f"Jellyfin: library '{name}' -> {path}")
         except requests.RequestException as e:
             warn(f"Jellyfin: could not configure library '{name}' ({e})")
@@ -999,6 +1027,110 @@ def configure_jellyfin() -> None:
                 ok("Jellyfin: library scan now also runs on startup")
     except requests.RequestException as e:
         warn(f"Jellyfin: could not set startup library scan trigger ({e})")
+
+
+# --- Sonarr / Radarr -> Jellyfin --------------------------------------------
+
+
+def configure_jellyfin_notifications(sonarr_key: str, radarr_key: str) -> None:
+    """Tell Jellyfin to rescan the moment Sonarr/Radarr finish an import.
+
+    Without this, Jellyfin only learns about new files on its own 12-hourly
+    scan (plus the startup trigger). That scan races multi-file imports --
+    a season pack landing while the scan is mid-folder produces episodes
+    Jellyfin cannot place, and they end up unplayable. A post-import library
+    update from the *arr is a targeted rescan of just that one folder, fired
+    once the files are already in place.
+    """
+    step("Sonarr / Radarr -> Jellyfin")
+
+    token = jellyfin_token()
+    if token is None:
+        skip("Jellyfin: no admin credentials in .env -- cannot create an API key for the *arrs")
+        _manual.append(
+            "Sonarr/Radarr: add a 'Emby / Jellyfin' connection (Settings -> Connect), "
+            "host jellyfin, port 8096, 'Update Library' on"
+        )
+        return
+    jf_headers = {"X-Emby-Token": token}
+
+    # Import/rename events change files on disk; grab/health do not. onGrab is
+    # deliberately left off -- it fires before the file exists.
+    wanted_events = {
+        "onDownload", "onUpgrade", "onRename", "onImportComplete",
+        "onEpisodeFileDelete", "onEpisodeFileDeleteForUpgrade", "onSeriesDelete",
+        "onMovieFileDelete", "onMovieFileDeleteForUpgrade", "onMovieDelete",
+    }
+
+    targets = [("Sonarr", SONARR_URL, sonarr_key), ("Radarr", RADARR_URL, radarr_key)]
+    for label, base, key in targets:
+        if not key:
+            continue
+        try:
+            existing = arr_get(base, "/api/v3/notification", key)
+            current = next((n for n in existing if n.get("implementation") == "MediaBrowser"), None)
+
+            # The *arr masks the apiKey field in GET responses ("********"), so
+            # it cannot be verified -- judge by the observable fields instead.
+            if (
+                current
+                and get_field(current, "host") == "jellyfin"
+                and get_field(current, "updateLibrary") is True
+                and current.get("onDownload")
+            ):
+                skip(f"{label}: Jellyfin library-update connection already set")
+                continue
+
+            jf_key = _ensure_jellyfin_api_key(jf_headers, label)
+            if jf_key is None:
+                warn(f"{label}: could not create a Jellyfin API key")
+                continue
+
+            schema = arr_get(base, "/api/v3/notification/schema", key)
+            template = next((s for s in schema if s.get("implementation") == "MediaBrowser"), None)
+            if template is None:
+                warn(f"{label}: no 'MediaBrowser' notification schema, skipping")
+                continue
+
+            payload = dict(current) if current else dict(template)
+            payload["name"] = "Jellyfin"
+            payload["implementation"] = "MediaBrowser"
+            payload["implementationName"] = template.get("implementationName", "Emby / Jellyfin")
+            payload["configContract"] = "MediaBrowserSettings"
+            for k in list(payload):
+                if k.startswith("on") and f"supportsOn{k[2:]}" in template:
+                    payload[k] = k in wanted_events
+            set_field(payload, "host", "jellyfin")
+            set_field(payload, "port", 8096)
+            set_field(payload, "useSsl", False)
+            set_field(payload, "apiKey", jf_key)
+            set_field(payload, "updateLibrary", True)
+            set_field(payload, "notify", False)
+
+            if current:
+                arr_put(base, f"/api/v3/notification/{current['id']}", key, payload)
+                ok(f"{label}: Jellyfin library-update connection corrected")
+            else:
+                arr_post(base, "/api/v3/notification", key, payload)
+                ok(f"{label}: Jellyfin library-update connection added")
+        except requests.HTTPError as e:
+            warn(f"{label}: could not set Jellyfin connection -- {e.response.text[:200]}")
+        except requests.RequestException as e:
+            warn(f"{label}: could not set Jellyfin connection ({e})")
+
+
+def _ensure_jellyfin_api_key(jf_headers: dict, app: str) -> str | None:
+    """Return an existing Jellyfin API key for `app`, creating one if needed."""
+    keys = requests.get(f"{JELLYFIN_URL}/Auth/Keys", headers=jf_headers, timeout=30).json()
+    for k in keys.get("Items", []):
+        if k.get("AppName") == app:
+            return k.get("AccessToken")
+    # POST /Auth/Keys returns 204 with no body -- re-read to get the token.
+    requests.post(
+        f"{JELLYFIN_URL}/Auth/Keys", headers=jf_headers, params={"app": app}, timeout=30
+    ).raise_for_status()
+    keys = requests.get(f"{JELLYFIN_URL}/Auth/Keys", headers=jf_headers, timeout=30).json()
+    return next((k.get("AccessToken") for k in keys.get("Items", []) if k.get("AppName") == app), None)
 
 
 # --- Jellyseerr ---------------------------------------------------------------
@@ -1233,6 +1365,7 @@ def main() -> int:
     configure_sabnzbd(sab_key)
     configure_bazarr(bazarr_key, sonarr_key or "", radarr_key or "")
     configure_jellyfin()
+    configure_jellyfin_notifications(sonarr_key or "", radarr_key or "")
     configure_jellyseerr(sonarr_key or "", radarr_key or "")
 
     print("\n" + "=" * 70)

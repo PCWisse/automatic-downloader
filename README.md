@@ -281,9 +281,11 @@ quality caps, seeder minimums, Prowlarr↔Sonarr/Radarr links, SABnzbd
 categories and whitelist, Bazarr connections, the Jellyfin wizard, libraries,
 hardware transcoding (NVENC by default, or VAAPI with `GPU_VENDOR=amd` — see
 [Using an AMD or Intel GPU instead of
-NVIDIA](#using-an-amd-or-intel-gpu-instead-of-nvidia)), and a startup trigger
+NVIDIA](#using-an-amd-or-intel-gpu-instead-of-nvidia)), a startup trigger
 on Jellyfin's library scan (see
-[§13](#13-jellyfin--the-library)). It uses each app's own REST API (the same
+[§13](#13-jellyfin--the-library)), and Sonarr/Radarr → Jellyfin connections so
+an import triggers an immediate targeted rescan (it also creates the Jellyfin
+API keys those need). It uses each app's own REST API (the same
 calls their web UIs make), so there is no browser automation to break when a
 UI changes.
 
@@ -460,9 +462,18 @@ Real-time monitoring only sees writes made from inside a container, so a
 host-side copy (e.g. from Windows Explorer) won't show up until the next scan
 or restart.
 
-If you ran the [automated setup](#7-run-the-automated-setup), both of these
-are already done — it adds a startup trigger to the existing scan schedule and
-leaves the interval trigger in place as the backstop.
+The most reliable trigger is Sonarr/Radarr themselves. In each: **Settings →
+Connect → + → Emby / Jellyfin**, host `jellyfin`, port `8096`, an API key from
+Jellyfin's **Dashboard → API Keys**, and **Update Library** on. Now a finished
+import tells Jellyfin to rescan *that one folder* — no waiting for the periodic
+scan, and no scan racing an in-progress multi-file import (which is how episodes
+end up as unplayable "Season Unknown" entries).
+
+If you ran the [automated setup](#7-run-the-automated-setup), all of this is
+already done — the startup trigger, the real-time-monitoring and read-only
+`/media` settings on both libraries, and the Sonarr/Radarr → Jellyfin
+connections (including their API keys). It also *corrects* a library whose
+real-time-monitoring got left off by an older setup run.
 
 If you have an NVIDIA GPU: **Dashboard → Playback → Transcoding** →
 [enable NVENC](#hardware-transcoding). AMD or Intel GPU instead? See
@@ -1433,7 +1444,8 @@ narrows the field fast.
 | --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Shows several servers and none work** | See[below](#jellyfin-shows-several-servers-and-none-work)                                                                                                      |
 | Library is empty                              | Files only appear after Sonarr/Radarr*import* them into `/data/library`. Raw downloads are not in the library                                             |
-| Nothing appears after a download              | **Dashboard → Scheduled Tasks → Scan Media Library**. If that finds it, real-time monitoring missed the event                                         |
+| Nothing appears after a download              | **Dashboard → Scheduled Tasks → Scan Media Library**. If that finds it, real-time monitoring missed the event — check the library has it enabled, and that Sonarr/Radarr have an *Emby / Jellyfin* connection with *Update Library* on |
+| Episode plays "unable to find a valid media" / stuck in "Season Unknown" | The scan caught a multi-file import mid-flight. On the series: **⋯ → Refresh metadata → Replace all metadata**. Prevent it by giving Sonarr/Radarr the Jellyfin connection above so imports trigger a clean rescan |
 | Write/permission errors on scan               | Untick*Save artwork into media folders* and *Save metadata as NFO* — `/media` is read-only by design                                                   |
 | Container won't start                         | Almost always the GPU`deploy:` block on a machine without NVIDIA — delete it, or switch to [`docker-compose.gpu-amd.yml`](#using-an-amd-or-intel-gpu-instead-of-nvidia) if you have an AMD/Intel GPU instead |
 | Can't identify a movie                        | Rename the folder to`Movie Name (Year)`, or use *Identify*                                                                                                |
