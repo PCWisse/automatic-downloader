@@ -15,8 +15,14 @@ Two things it deliberately cannot do, because they need YOUR accounts:
   * Indexers in Prowlarr (which sites, plus your credentials)
   * Usenet provider in SABnzbd (your paid subscription details)
 Both are reported at the end as remaining manual steps.
+
+One thing needs a hand exactly once: on a brand-new install qBittorrent's
+password lives only in its Docker log, which this container cannot read (no
+Docker socket, by design). Pass QBITTORRENT_BOOTSTRAP_PASSWORD on that first
+run and the script sets QBITTORRENT_PASSWORD permanently -- see README step 6.
 """
 
+import json
 import os
 import sys
 import time
@@ -36,6 +42,10 @@ MEDIA_ROOT_IN_CONTAINER = "/data"  # identical in every service, see README
 # `setup` service for the override.
 QBIT_URL = os.environ.get("QBIT_URL", "http://gluetun:8090")
 PROWLARR_URL = os.environ.get("PROWLARR_URL", "http://gluetun:9696")
+# Byparr (FlareSolverr-compatible Cloudflare solver) as Prowlarr must reach it.
+# On the VPN stack Prowlarr shares gluetun's namespace with Byparr, so it is
+# just localhost; docker-compose.novpn.yml overrides this to the container name.
+BYPARR_URL = os.environ.get("BYPARR_URL", "http://localhost:8191/")
 # The host Sonarr/Radarr are told to use for the qBittorrent download client.
 # Not always the same string as QBIT_URL's host -- kept separate on purpose.
 QBIT_HOST = os.environ.get("QBIT_HOST", "gluetun")
@@ -48,6 +58,12 @@ JELLYSEERR_URL = "http://jellyseerr:5055"
 
 QBIT_USER = os.environ.get("QBITTORRENT_USER", "")
 QBIT_PASSWORD = os.environ.get("QBITTORRENT_PASSWORD", "")
+# One-shot credential for the very first run. On a fresh install qBittorrent
+# invents a random password and prints it ONLY to its Docker log, which this
+# container deliberately cannot read (no Docker socket -- see the setup service
+# in docker-compose.yml). Pass that password in once and the script sets
+# QBITTORRENT_PASSWORD permanently; after that this is no longer needed.
+QBIT_BOOTSTRAP_PASSWORD = os.environ.get("QBITTORRENT_BOOTSTRAP_PASSWORD", "")
 JELLYFIN_USER = os.environ.get("JELLYFIN_ADMIN_USER", "")
 JELLYFIN_PASSWORD = os.environ.get("JELLYFIN_ADMIN_PASSWORD", "")
 
@@ -68,6 +84,12 @@ MAX_SIZE_MB_PER_MIN_2160P = int(os.environ.get("MAX_SIZE_MB_PER_MIN_2160P", 252)
 # profile if it doesn't. "Any" is deliberately avoided -- despite the name it
 # EXCLUDES 4K (see README).
 JELLYSEERR_PROFILE = os.environ.get("JELLYSEERR_QUALITY_PROFILE", "HD-1080p")
+# Sonarr and Radarr profile names diverge as soon as Recyclarr is involved --
+# the TRaSH 4K profiles are "WEB-2160p" in Sonarr but "[SQP] SQP-1 WEB (2160p)"
+# in Radarr -- so one shared name cannot match both. These override per app and
+# fall back to the shared value above.
+JELLYSEERR_SONARR_PROFILE = os.environ.get("JELLYSEERR_SONARR_PROFILE", "") or JELLYSEERR_PROFILE
+JELLYSEERR_RADARR_PROFILE = os.environ.get("JELLYSEERR_RADARR_PROFILE", "") or JELLYSEERR_PROFILE
 JELLYSEERR_EMAIL = os.environ.get("JELLYSEERR_ADMIN_EMAIL", "")
 
 # --- output helpers ----------------------------------------------------------
@@ -191,6 +213,112 @@ def read_sabnzbd_api_key(config_path: str) -> str | None:
     return None
 
 
+# --- host bind-mount permissions ---------------------------------------------
+
+# Recyclarr is the only service that runs as a NON-root user (user: 1000:1000 in
+# compose) against a BIND MOUNT rather than a named volume. On a Linux host a
+# fresh clone leaves ./recyclarr-config owned by whoever cloned it -- usually
+# root -- and Recyclarr then crash-loops on:
+#
+#     Access to the path '/config/logs' is denied. [ Permission denied ]
+#
+# Named volumes never hit this because Docker creates them with the right owner,
+# and Docker Desktop does not either because its bind mounts ignore ownership.
+# So it is specifically a Linux-host failure, invisible on Windows/macOS -- which
+# is exactly the kind of thing worth fixing here instead of in the README.
+HOST_PUID = int(os.environ.get("PUID", 1000))
+HOST_PGID = int(os.environ.get("PGID", 1000))
+
+# Where the setup service mounts those host directories, read-write.
+BIND_MOUNTS = (("recyclarr-config", "/hostcfg/recyclarr"),)
+
+# Recyclarr's own config lives here (same mount, read side). When it contains a
+# quality_definition block for an app, Recyclarr owns that app's quality
+# definitions and setup must not fight it -- see configure_quality_sizes().
+RECYCLARR_CONFIG_DIRS = (
+    "/hostcfg/recyclarr/configs",  # `recyclarr config create` writes here
+    "/hostcfg/recyclarr",          # a hand-written recyclarr.yml sits at the root
+)
+
+
+def recyclarr_manages_quality(app: str) -> bool:
+    """True when a Recyclarr config defines quality_definition for this app.
+
+    Recyclarr syncs quality definitions (the 2160p size caps among them) from
+    the TRaSH Guides on its own schedule. If setup also writes them, the two
+    ping-pong: setup on every manual run, Recyclarr nightly. Whoever the user
+    pointed at those profiles should own the sizes too -- so setup backs off.
+    """
+    for d in RECYCLARR_CONFIG_DIRS:
+        if not os.path.isdir(d):
+            continue
+        for name in os.listdir(d):
+            if not name.endswith((".yml", ".yaml")):
+                continue
+            try:
+                with open(os.path.join(d, name), encoding="utf-8") as fh:
+                    doc = yaml.safe_load(fh) or {}
+            except (OSError, yaml.YAMLError):
+                continue
+            for instance in (doc.get(app) or {}).values():
+                if isinstance(instance, dict) and "quality_definition" in instance:
+                    return True
+    return False
+
+
+def configure_host_permissions() -> None:
+    step("Host bind-mount permissions")
+
+    for label, mount in BIND_MOUNTS:
+        if not os.path.isdir(mount):
+            skip(f"{label}: not mounted into setup, cannot check ownership")
+            continue
+
+        # Checking the top level plus its immediate children is enough to spot a
+        # fresh clone (uniformly root-owned) without stat-ing the ~73 MB
+        # TRaSH-Guides clone under resources/ on every single run.
+        probes = [mount] + [os.path.join(mount, n) for n in os.listdir(mount)]
+        if all(_owned_correctly(p) for p in probes):
+            skip(f"{label}: already owned by {HOST_PUID}:{HOST_PGID}")
+            continue
+
+        try:
+            fixed = _chown_tree(mount)
+        except PermissionError:
+            warn(
+                f"{label}: owned by the wrong user and setup could not change it. "
+                f"Run on the host:  sudo chown -R {HOST_PUID}:{HOST_PGID} ./{label}"
+            )
+            _manual.append(f"chown -R {HOST_PUID}:{HOST_PGID} ./{label} on the host")
+            continue
+        ok(f"{label}: ownership corrected to {HOST_PUID}:{HOST_PGID} ({fixed} path(s))")
+
+
+def _owned_correctly(path: str) -> bool:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return True  # unreadable/vanished -- not our problem to diagnose here
+    return st.st_uid == HOST_PUID and st.st_gid == HOST_PGID
+
+
+def _chown_tree(root: str) -> int:
+    """chown -R, touching only what is actually wrong. Returns paths changed."""
+    changed = 0
+    for path in _walk_paths(root):
+        if not _owned_correctly(path):
+            os.chown(path, HOST_PUID, HOST_PGID)
+            changed += 1
+    return changed
+
+
+def _walk_paths(root: str):
+    yield root
+    for parent, dirs, files in os.walk(root):
+        for name in dirs + files:
+            yield os.path.join(parent, name)
+
+
 # --- readiness ---------------------------------------------------------------
 
 
@@ -213,33 +341,83 @@ def wait_for(name: str, url: str, timeout: int = 180) -> bool:
 # --- qBittorrent -------------------------------------------------------------
 
 
+def qbit_login(session: requests.Session, password: str) -> bool:
+    """True when these credentials produce a session cookie."""
+    session.cookies.clear()
+    try:
+        session.post(
+            f"{QBIT_URL}/api/v2/auth/login",
+            data={"username": QBIT_USER, "password": password},
+            headers={"Referer": QBIT_URL},
+            timeout=30,
+        )
+    except requests.RequestException:
+        return False
+    # 5.x answers 204 with a session cookie; older versions answered 200 "Ok."
+    return any(c.startswith("QBT_SID") for c in session.cookies.keys())
+
+
+def qbit_authenticate(session: requests.Session) -> bool:
+    """Log in, setting the .env password permanently on a first run.
+
+    Three outcomes, in order of preference:
+      1. The .env password already works -- nothing to do.
+      2. It doesn't, but QBITTORRENT_BOOTSTRAP_PASSWORD does. That is the random
+         password qBittorrent printed to its Docker log on first start. Use it
+         once to set the .env password for good, so Sonarr, Radarr and
+         speed-monitor (which all read QBITTORRENT_PASSWORD) can authenticate.
+      3. Neither works -- explain exactly how to get the bootstrap password.
+    """
+    if qbit_login(session, QBIT_PASSWORD):
+        ok("authenticated")
+        return True
+
+    if QBIT_BOOTSTRAP_PASSWORD and qbit_login(session, QBIT_BOOTSTRAP_PASSWORD):
+        info("bootstrap password accepted -- setting the .env password permanently")
+        r = session.post(
+            f"{QBIT_URL}/api/v2/app/setPreferences",
+            data={"json": json.dumps({"web_ui_password": QBIT_PASSWORD})},
+            headers={"Referer": QBIT_URL},
+            timeout=30,
+        )
+        r.raise_for_status()
+        # Prove it took rather than trusting the 200 -- a fresh login, not the
+        # session cookie we already hold, which stays valid either way.
+        if not qbit_login(session, QBIT_PASSWORD):
+            warn("qBittorrent: password change reported success but the new password does not log in")
+            _manual.append("Set the qBittorrent WebUI password by hand to match .env, then re-run setup")
+            return False
+        ok("WebUI password set to QBITTORRENT_PASSWORD from .env")
+        return True
+
+    warn(
+        "qBittorrent login failed with the .env password. On a fresh install qBittorrent "
+        "generates a random temporary password and prints it only to its Docker log, which "
+        "this container cannot read (no Docker socket, by design). Get it on the host with:  "
+        "docker logs qbittorrent 2>&1 | grep -i 'temporary password'  -- then re-run:  "
+        "QBITTORRENT_BOOTSTRAP_PASSWORD='<that password>' docker compose run --rm setup"
+    )
+    _manual.append(
+        "qBittorrent: re-run setup with QBITTORRENT_BOOTSTRAP_PASSWORD set to the temporary "
+        "password from `docker logs qbittorrent`, and it will set the .env one permanently"
+    )
+    return False
+
+
 def configure_qbittorrent() -> bool:
     step("qBittorrent")
     if not QBIT_USER or not QBIT_PASSWORD:
         warn(
             "QBITTORRENT_USER / QBITTORRENT_PASSWORD not set in .env -- skipping. "
-            "qBittorrent generates a random temporary password on first start and only "
-            "prints it to its Docker log, so it cannot be read from here. "
-            "See README step 6, then re-run this script."
+            "Set them (any password you like -- this script will apply it to qBittorrent), "
+            "then re-run."
         )
-        _manual.append("Set a permanent qBittorrent password (README step 6), put it in .env, re-run setup")
+        _manual.append("Set QBITTORRENT_USER / QBITTORRENT_PASSWORD in .env, then re-run setup")
         return False
 
     s = requests.Session()
-    r = s.post(
-        f"{QBIT_URL}/api/v2/auth/login",
-        data={"username": QBIT_USER, "password": QBIT_PASSWORD},
-        timeout=30,
-    )
-    # 5.x answers 204 with a session cookie; older versions answered 200 "Ok."
-    if not any(c.startswith("QBT_SID") for c in s.cookies.keys()):
-        warn(
-            f"qBittorrent login failed (HTTP {r.status_code}). If this is a fresh install, set a "
-            "permanent password first (README step 6) and put it in .env."
-        )
-        _manual.append("Fix qBittorrent credentials in .env, then re-run setup")
+    if not qbit_authenticate(s):
         return False
-    ok("authenticated")
 
     prefs = {
         "save_path": f"{MEDIA_ROOT_IN_CONTAINER}/torrents/complete",
@@ -257,7 +435,7 @@ def configure_qbittorrent() -> bool:
         "dht": True,
         "pex": True,
     }
-    resp = s.post(f"{QBIT_URL}/api/v2/app/setPreferences", data={"json": __import__("json").dumps(prefs)}, timeout=30)
+    resp = s.post(f"{QBIT_URL}/api/v2/app/setPreferences", data={"json": json.dumps(prefs)}, timeout=30)
     resp.raise_for_status()
 
     current = s.get(f"{QBIT_URL}/api/v2/app/preferences", timeout=30).json()
@@ -317,6 +495,60 @@ def configure_prowlarr_apps(prowlarr_key: str, sonarr_key: str, radarr_key: str)
             ok(f"{name}: linked (addOnly)")
         except requests.HTTPError as e:
             warn(f"{name}: could not link to Prowlarr -- {e.response.text[:200]}")
+
+
+def configure_byparr_proxy(prowlarr_key: str) -> None:
+    """Register Byparr as a FlareSolverr proxy in Prowlarr.
+
+    Byparr is a drop-in FlareSolverr replacement -- a headless browser that
+    clears Cloudflare's JS challenge for indexers that sit behind it. The
+    container is already running (see docker-compose.yml); this just tells
+    Prowlarr about it.
+
+    It is opt-in PER INDEXER: Prowlarr only routes an indexer through the
+    proxy when that indexer carries the matching tag. We create the proxy
+    and a 'byparr' tag; the user still has to put that tag on whichever
+    indexers actually need it (reported at the end).
+    """
+    step("Prowlarr -> Byparr (Cloudflare solver)")
+
+    existing = arr_get(PROWLARR_URL, "/api/v1/indexerProxy", prowlarr_key)
+    if any(p.get("implementation") == "FlareSolverr" for p in existing):
+        skip("Byparr: FlareSolverr proxy already present")
+        _manual.append(
+            "Prowlarr: tag any Cloudflare-protected indexer with 'byparr' so it "
+            "routes through the solver (Indexer -> Tags)"
+        )
+        return
+
+    # Get or create the 'byparr' tag.
+    tags = arr_get(PROWLARR_URL, "/api/v1/tag", prowlarr_key)
+    tag = next((t for t in tags if t.get("label") == "byparr"), None)
+    if tag is None:
+        tag = arr_post(PROWLARR_URL, "/api/v1/tag", prowlarr_key, {"label": "byparr"})
+    tag_id = tag["id"]
+
+    schemas = arr_get(PROWLARR_URL, "/api/v1/indexerProxy/schema", prowlarr_key)
+    schema = next((s for s in schemas if s.get("implementation") == "FlareSolverr"), None)
+    if schema is None:
+        warn("Byparr: Prowlarr has no FlareSolverr proxy schema, skipping")
+        return
+
+    payload = dict(schema)
+    payload["name"] = "byparr"
+    payload["tags"] = [tag_id]
+    set_field(payload, "host", BYPARR_URL)
+    set_field(payload, "requestTimeout", 60)
+
+    try:
+        arr_post(PROWLARR_URL, "/api/v1/indexerProxy", prowlarr_key, payload)
+        ok(f"Byparr: registered as FlareSolverr proxy ({BYPARR_URL}), tag 'byparr'")
+        _manual.append(
+            "Prowlarr: tag any Cloudflare-protected indexer with 'byparr' so it "
+            "routes through the solver (Indexer -> Tags)"
+        )
+    except requests.HTTPError as e:
+        warn(f"Byparr: could not register proxy -- {e.response.text[:200]}")
 
 
 # --- Sonarr / Radarr ---------------------------------------------------------
@@ -403,6 +635,9 @@ def configure_root_folder(app: str, base: str, key: str) -> None:
 
 def configure_quality_sizes(app: str, base: str, key: str) -> None:
     """Cap 2160p sizes. Value is MB-per-minute-of-runtime, not a flat size."""
+    if recyclarr_manages_quality(app):
+        skip(f"{app}: 2160p size caps -> left to Recyclarr (it has a quality_definition for {app})")
+        return
     defs = arr_get(base, "/api/v3/qualitydefinition", key)
     changed = 0
     for d in defs:
@@ -576,6 +811,25 @@ def configure_bazarr(bazarr_key: str | None, sonarr_key: str, radarr_key: str) -
 # --- Jellyfin ----------------------------------------------------------------
 
 
+def jellyfin_token() -> str | None:
+    """Authenticate as the .env admin and return an access token, or None."""
+    if not JELLYFIN_USER or not JELLYFIN_PASSWORD:
+        return None
+    try:
+        r = requests.post(
+            f"{JELLYFIN_URL}/Users/AuthenticateByName",
+            json={"Username": JELLYFIN_USER, "Pw": JELLYFIN_PASSWORD},
+            headers={
+                "Authorization": 'MediaBrowser Client="setup", Device="setup", DeviceId="setup", Version="1.0.0"'
+            },
+            timeout=30,
+        )
+        r.raise_for_status()
+        return r.json()["AccessToken"]
+    except (requests.RequestException, KeyError):
+        return None
+
+
 def configure_jellyfin() -> None:
     step("Jellyfin")
     try:
@@ -634,54 +888,82 @@ def configure_jellyfin() -> None:
         _manual.append("Jellyfin: add Movies (/media/movies) and Shows (/media/tv) libraries")
         return
 
-    try:
-        auth = requests.post(
-            f"{JELLYFIN_URL}/Users/AuthenticateByName",
-            json={"Username": JELLYFIN_USER, "Pw": JELLYFIN_PASSWORD},
-            headers={
-                "Authorization": 'MediaBrowser Client="setup", Device="setup", DeviceId="setup", Version="1.0.0"'
-            },
-            timeout=30,
-        )
-        auth.raise_for_status()
-        token = auth.json()["AccessToken"]
-    except requests.RequestException as e:
-        warn(f"Jellyfin: could not authenticate as '{JELLYFIN_USER}' ({e})")
+    token = jellyfin_token()
+    if token is None:
+        warn(f"Jellyfin: could not authenticate as '{JELLYFIN_USER}'")
         _manual.append("Jellyfin: check JELLYFIN_ADMIN_USER / JELLYFIN_ADMIN_PASSWORD in .env")
         return
 
     headers = {"X-Emby-Token": token}
     try:
         folders = requests.get(f"{JELLYFIN_URL}/Library/VirtualFolders", headers=headers, timeout=30).json()
-        have = {f.get("Name") for f in folders}
+        have = {f.get("Name"): f for f in folders}
     except requests.RequestException as e:
         warn(f"Jellyfin: could not list libraries ({e})")
         return
 
+    # The options every library must carry. EnableRealtimeMonitor is the one
+    # that actually broke playback in the wild: a library created by an older
+    # setup came up with it OFF, so new episodes were only ever seen by the
+    # 12-hourly scan -- which raced Sonarr's multi-file imports and produced
+    # unplayable "Season Unknown" entries. SaveLocalMetadata must stay off
+    # because /media is read-only; writing there logs an error every scan.
+    # (EnableInternetProviders is deliberately not listed -- on Jellyfin 10.11
+    # it is a legacy derived flag that always reads back False with the modern
+    # empty TypeOptions, so asserting it would "correct" on every run. Internet
+    # metadata works regardless via the server-default fetchers.)
+    want_opts = {
+        "EnableRealtimeMonitor": True,
+        "SaveLocalMetadata": False,
+    }
+
     for name, ctype, path in (("Movies", "movies", "/media/movies"), ("Shows", "tvshows", "/media/tv")):
-        if name in have:
-            skip(f"Jellyfin: library '{name}' already exists")
-            continue
         try:
-            # /media is mounted read-only, so metadata/artwork must NOT be saved
-            # into the media folders -- that would log write failures every scan.
-            options = {
-                "EnableRealtimeMonitor": True,
-                "SaveLocalMetadata": False,
-                "EnableInternetProviders": True,
-                "PathInfos": [{"Path": path}],
-            }
-            r = requests.post(
+            folder = have.get(name)
+            if folder is not None:
+                locations = folder.get("Locations") or []
+                opts = folder.get("LibraryOptions") or {}
+                item_id = folder.get("ItemId")
+
+                # A library can exist with no folder attached -- it then scans
+                # nothing and stays permanently empty.
+                if path not in locations:
+                    requests.post(
+                        f"{JELLYFIN_URL}/Library/VirtualFolders/Paths",
+                        headers=headers,
+                        params={"refreshLibrary": "false"},
+                        json={"Name": name, "PathInfo": {"Path": path}},
+                        timeout=60,
+                    ).raise_for_status()
+                    ok(f"Jellyfin: library '{name}' had no media folder, attached {path}")
+
+                drift = {k: v for k, v in want_opts.items() if opts.get(k) != v}
+                if drift and item_id:
+                    merged = {**opts, **want_opts}
+                    requests.post(
+                        f"{JELLYFIN_URL}/Library/VirtualFolders/LibraryOptions",
+                        headers=headers,
+                        json={"Id": item_id, "LibraryOptions": merged},
+                        timeout=60,
+                    ).raise_for_status()
+                    ok(f"Jellyfin: library '{name}' options corrected ({', '.join(sorted(drift))})")
+                elif not drift and path in locations:
+                    skip(f"Jellyfin: library '{name}' already correct -> {path}")
+                continue
+
+            # PathInfos MUST sit under LibraryOptions: sent at the top level
+            # Jellyfin still returns 204 but silently creates an EMPTY library.
+            options = {"LibraryOptions": {**want_opts, "PathInfos": [{"Path": path}]}}
+            requests.post(
                 f"{JELLYFIN_URL}/Library/VirtualFolders",
                 headers=headers,
                 params={"name": name, "collectionType": ctype, "refreshLibrary": "true"},
                 json=options,
                 timeout=60,
-            )
-            r.raise_for_status()
+            ).raise_for_status()
             ok(f"Jellyfin: library '{name}' -> {path}")
         except requests.RequestException as e:
-            warn(f"Jellyfin: could not create library '{name}' ({e})")
+            warn(f"Jellyfin: could not configure library '{name}' ({e})")
 
     # Hardware transcoding: passing the GPU through in compose is necessary but
     # NOT sufficient -- it must be switched on here too, or it silently uses CPU.
@@ -745,6 +1027,110 @@ def configure_jellyfin() -> None:
                 ok("Jellyfin: library scan now also runs on startup")
     except requests.RequestException as e:
         warn(f"Jellyfin: could not set startup library scan trigger ({e})")
+
+
+# --- Sonarr / Radarr -> Jellyfin --------------------------------------------
+
+
+def configure_jellyfin_notifications(sonarr_key: str, radarr_key: str) -> None:
+    """Tell Jellyfin to rescan the moment Sonarr/Radarr finish an import.
+
+    Without this, Jellyfin only learns about new files on its own 12-hourly
+    scan (plus the startup trigger). That scan races multi-file imports --
+    a season pack landing while the scan is mid-folder produces episodes
+    Jellyfin cannot place, and they end up unplayable. A post-import library
+    update from the *arr is a targeted rescan of just that one folder, fired
+    once the files are already in place.
+    """
+    step("Sonarr / Radarr -> Jellyfin")
+
+    token = jellyfin_token()
+    if token is None:
+        skip("Jellyfin: no admin credentials in .env -- cannot create an API key for the *arrs")
+        _manual.append(
+            "Sonarr/Radarr: add a 'Emby / Jellyfin' connection (Settings -> Connect), "
+            "host jellyfin, port 8096, 'Update Library' on"
+        )
+        return
+    jf_headers = {"X-Emby-Token": token}
+
+    # Import/rename events change files on disk; grab/health do not. onGrab is
+    # deliberately left off -- it fires before the file exists.
+    wanted_events = {
+        "onDownload", "onUpgrade", "onRename", "onImportComplete",
+        "onEpisodeFileDelete", "onEpisodeFileDeleteForUpgrade", "onSeriesDelete",
+        "onMovieFileDelete", "onMovieFileDeleteForUpgrade", "onMovieDelete",
+    }
+
+    targets = [("Sonarr", SONARR_URL, sonarr_key), ("Radarr", RADARR_URL, radarr_key)]
+    for label, base, key in targets:
+        if not key:
+            continue
+        try:
+            existing = arr_get(base, "/api/v3/notification", key)
+            current = next((n for n in existing if n.get("implementation") == "MediaBrowser"), None)
+
+            # The *arr masks the apiKey field in GET responses ("********"), so
+            # it cannot be verified -- judge by the observable fields instead.
+            if (
+                current
+                and get_field(current, "host") == "jellyfin"
+                and get_field(current, "updateLibrary") is True
+                and current.get("onDownload")
+            ):
+                skip(f"{label}: Jellyfin library-update connection already set")
+                continue
+
+            jf_key = _ensure_jellyfin_api_key(jf_headers, label)
+            if jf_key is None:
+                warn(f"{label}: could not create a Jellyfin API key")
+                continue
+
+            schema = arr_get(base, "/api/v3/notification/schema", key)
+            template = next((s for s in schema if s.get("implementation") == "MediaBrowser"), None)
+            if template is None:
+                warn(f"{label}: no 'MediaBrowser' notification schema, skipping")
+                continue
+
+            payload = dict(current) if current else dict(template)
+            payload["name"] = "Jellyfin"
+            payload["implementation"] = "MediaBrowser"
+            payload["implementationName"] = template.get("implementationName", "Emby / Jellyfin")
+            payload["configContract"] = "MediaBrowserSettings"
+            for k in list(payload):
+                if k.startswith("on") and f"supportsOn{k[2:]}" in template:
+                    payload[k] = k in wanted_events
+            set_field(payload, "host", "jellyfin")
+            set_field(payload, "port", 8096)
+            set_field(payload, "useSsl", False)
+            set_field(payload, "apiKey", jf_key)
+            set_field(payload, "updateLibrary", True)
+            set_field(payload, "notify", False)
+
+            if current:
+                arr_put(base, f"/api/v3/notification/{current['id']}", key, payload)
+                ok(f"{label}: Jellyfin library-update connection corrected")
+            else:
+                arr_post(base, "/api/v3/notification", key, payload)
+                ok(f"{label}: Jellyfin library-update connection added")
+        except requests.HTTPError as e:
+            warn(f"{label}: could not set Jellyfin connection -- {e.response.text[:200]}")
+        except requests.RequestException as e:
+            warn(f"{label}: could not set Jellyfin connection ({e})")
+
+
+def _ensure_jellyfin_api_key(jf_headers: dict, app: str) -> str | None:
+    """Return an existing Jellyfin API key for `app`, creating one if needed."""
+    keys = requests.get(f"{JELLYFIN_URL}/Auth/Keys", headers=jf_headers, timeout=30).json()
+    for k in keys.get("Items", []):
+        if k.get("AppName") == app:
+            return k.get("AccessToken")
+    # POST /Auth/Keys returns 204 with no body -- re-read to get the token.
+    requests.post(
+        f"{JELLYFIN_URL}/Auth/Keys", headers=jf_headers, params={"app": app}, timeout=30
+    ).raise_for_status()
+    keys = requests.get(f"{JELLYFIN_URL}/Auth/Keys", headers=jf_headers, timeout=30).json()
+    return next((k.get("AccessToken") for k in keys.get("Items", []) if k.get("AppName") == app), None)
 
 
 # --- Jellyseerr ---------------------------------------------------------------
@@ -833,18 +1219,17 @@ def configure_jellyseerr(sonarr_key: str, radarr_key: str) -> None:
     # Sonarr / Radarr. The /test endpoint doubles as the only way to read an
     # app's quality profiles and root folders through Jellyseerr.
     targets = (
-        ("radarr", "Radarr", radarr_key, 7878, f"{MEDIA_ROOT_IN_CONTAINER}/library/movies"),
-        ("sonarr", "Sonarr", sonarr_key, 8989, f"{MEDIA_ROOT_IN_CONTAINER}/library/tv"),
+        ("radarr", "Radarr", radarr_key, 7878, f"{MEDIA_ROOT_IN_CONTAINER}/library/movies",
+         JELLYSEERR_RADARR_PROFILE),
+        ("sonarr", "Sonarr", sonarr_key, 8989, f"{MEDIA_ROOT_IN_CONTAINER}/library/tv",
+         JELLYSEERR_SONARR_PROFILE),
     )
-    for slug, label, key, port, want_dir in targets:
+    for slug, label, key, port, want_dir, want_profile in targets:
         if not key:
             warn(f"Jellyseerr: no {label} API key, skipping")
             continue
         try:
             existing = s.get(f"{JELLYSEERR_URL}/api/v1/settings/{slug}", timeout=30).json()
-            if existing:
-                skip(f"Jellyseerr: {label} already connected")
-                continue
 
             conn = {"hostname": slug, "port": port, "apiKey": key, "useSsl": False, "baseUrl": ""}
             probe = s.post(f"{JELLYSEERR_URL}/api/v1/settings/{slug}/test", json=conn, timeout=60)
@@ -857,13 +1242,37 @@ def configure_jellyseerr(sonarr_key: str, radarr_key: str) -> None:
                 warn(f"Jellyseerr: {label} returned no profiles/root folders")
                 continue
 
-            # Prefer the configured name, then anything but "Any" -- which
-            # despite the name EXCLUDES 4K and traps people (see README).
-            chosen = next((p for p in profiles if p["name"] == JELLYSEERR_PROFILE), None)
+            # Prefer the configured name. Falling back silently is how people end
+            # up requesting everything at SD, so say so loudly when it happens --
+            # and never fall back to "Any", which despite the name EXCLUDES 4K.
+            chosen = next((p for p in profiles if p["name"] == want_profile), None)
             if chosen is None:
-                chosen = next((p for p in profiles if p["name"].lower() != "any"), profiles[0])
-                info(f"({label}: '{JELLYSEERR_PROFILE}' not found, using '{chosen['name']}')")
+                chosen = next((p for p in profiles if p["name"] == "HD-1080p"), None)
+                chosen = chosen or next((p for p in profiles if p["name"].lower() != "any"), profiles[0])
+                warn(
+                    f"Jellyseerr: {label} has no quality profile named '{want_profile}' -- "
+                    f"falling back to '{chosen['name']}'. Set JELLYSEERR_{label.upper()}_PROFILE "
+                    "in .env to one of: " + ", ".join(p["name"] for p in profiles)
+                )
             root = want_dir if want_dir in roots else roots[0]
+
+            if existing:
+                # Already connected. Only correct the quality profile if it has
+                # drifted from what .env asks for -- anything else the user may
+                # have tuned in Jellyseerr's UI is left exactly as it is.
+                svc = next((e for e in existing if e.get("isDefault")), existing[0])
+                if svc.get("activeProfileId") == chosen["id"]:
+                    skip(f"Jellyseerr: {label} already connected -> {svc.get('activeProfileName')}")
+                    continue
+                # 'id' is read-only on this endpoint and 400s if sent back.
+                body = {k: v for k, v in svc.items() if k != "id"}
+                body["activeProfileId"] = chosen["id"]
+                body["activeProfileName"] = chosen["name"]
+                s.put(
+                    f"{JELLYSEERR_URL}/api/v1/settings/{slug}/{svc['id']}", json=body, timeout=60
+                ).raise_for_status()
+                ok(f"Jellyseerr: {label} quality profile {svc.get('activeProfileName')!r} -> {chosen['name']!r}")
+                continue
 
             body = {
                 **conn,
@@ -908,6 +1317,11 @@ def main() -> int:
     print("  your own accounts. Safe to re-run at any time.")
     print("=" * 70)
 
+    # Before waiting on services: a wrongly-owned recyclarr-config makes the
+    # recyclarr container crash-loop, and the fix is on the host filesystem, not
+    # in any app's API. Do it first so a fresh clone comes up clean.
+    configure_host_permissions()
+
     step("Waiting for services")
     wait_for("qBittorrent", f"{QBIT_URL}/api/v2/app/version")
     wait_for("Prowlarr", f"{PROWLARR_URL}/api/v1/system/status")
@@ -935,6 +1349,7 @@ def main() -> int:
 
     if prowlarr_key:
         configure_prowlarr_apps(prowlarr_key, sonarr_key or "", radarr_key or "")
+        configure_byparr_proxy(prowlarr_key)
         _manual.append("Prowlarr: add your indexers (http://localhost:9696) -- needs your own accounts")
 
     for app, base, key in (("sonarr", SONARR_URL, sonarr_key), ("radarr", RADARR_URL, radarr_key)):
@@ -950,6 +1365,7 @@ def main() -> int:
     configure_sabnzbd(sab_key)
     configure_bazarr(bazarr_key, sonarr_key or "", radarr_key or "")
     configure_jellyfin()
+    configure_jellyfin_notifications(sonarr_key or "", radarr_key or "")
     configure_jellyseerr(sonarr_key or "", radarr_key or "")
 
     print("\n" + "=" * 70)

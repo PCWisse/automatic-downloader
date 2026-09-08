@@ -265,9 +265,22 @@ services:
       - prowlarr-config:/keys/prowlarr:ro
       - bazarr-config:/keys/bazarr:ro
       - sabnzbd-config:/keys/sabnzbd:ro
+      # Read-WRITE: the only bind mount a non-root service (recyclarr,
+      # user 1000:1000) uses. On a fresh Linux clone this is root-owned and
+      # recyclarr crash-loops on it -- setup fixes the ownership. See
+      # configure_host_permissions() in configure.py.
+      - ./recyclarr-config:/hostcfg/recyclarr
     environment:
       - QBITTORRENT_USER=${QBITTORRENT_USER:-}
+      # Ownership setup should give ./recyclarr-config -- match recyclarr's
+      # `user:` in this file. Defaults suit the linuxserver PUID/PGID convention.
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
       - QBITTORRENT_PASSWORD=${QBITTORRENT_PASSWORD:-}
+      # First run only: the random password qBittorrent printed to its Docker
+      # log. Setup uses it once to apply QBITTORRENT_PASSWORD permanently.
+      #   QBITTORRENT_BOOTSTRAP_PASSWORD='...' docker compose run --rm setup
+      - QBITTORRENT_BOOTSTRAP_PASSWORD=${QBITTORRENT_BOOTSTRAP_PASSWORD:-}
       - JELLYFIN_ADMIN_USER=${JELLYFIN_ADMIN_USER:-}
       - JELLYFIN_ADMIN_PASSWORD=${JELLYFIN_ADMIN_PASSWORD:-}
       # nvidia (default), amd, or none -- picks NVENC vs VAAPI vs no hardware
@@ -278,6 +291,10 @@ services:
       # Quality profile Jellyseerr requests at, and the optional email for the
       # admin account it creates. See README's "Jellyseerr -- requests".
       - JELLYSEERR_QUALITY_PROFILE=${JELLYSEERR_QUALITY_PROFILE:-HD-1080p}
+      # Per-app overrides. Sonarr and Radarr profile names diverge once
+      # Recyclarr builds its own, so one shared name cannot match both.
+      - JELLYSEERR_SONARR_PROFILE=${JELLYSEERR_SONARR_PROFILE:-}
+      - JELLYSEERR_RADARR_PROFILE=${JELLYSEERR_RADARR_PROFILE:-}
       - JELLYSEERR_ADMIN_EMAIL=${JELLYSEERR_ADMIN_EMAIL:-}
       # Same values documented in the README; change here to change both.
       - QBIT_MAX_ACTIVE_DOWNLOADS=4

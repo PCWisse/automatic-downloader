@@ -15,7 +15,7 @@ subtitles, and it appears in Jellyfin ready to watch.
 | **SABnzbd**     | Usenet downloader                                                                  | [http://localhost:8080](http://localhost:8080)       |
 | **qBittorrent** | Torrent downloader                                                                 | [http://localhost:8090](http://localhost:8090)       |
 | **gluetun**     | VPN tunnel + kill switch                                                           | [http://localhost:8010](http://localhost:8010) (API) |
-| Byparr                | Anti-bot browser proxy — outside this guide's scope, not wired into Prowlarr here | —                                                  |
+| Byparr                | FlareSolverr-compatible Cloudflare solver — `setup` registers it in Prowlarr; tag indexers `byparr` to use it | —                                                  |
 | Recyclarr             | Syncs TRaSH Guides quality profiles into Sonarr/Radarr (scheduled, not a live UI)  | —                                                  |
 
 Everything except Jellyfin binds to `127.0.0.1` by default — admin UIs are not
@@ -235,26 +235,39 @@ qBittorrent's connectivity entirely. **Do not skip this.**
 
 ## 6. Set a permanent qBittorrent password
 
-This is the one step that **cannot** be automated. qBittorrent generates a
-random temporary password on every restart and prints it **only to its Docker
-log** — not to any file the setup script could read. Reading it would mean
-handing the script access to the Docker socket, which is a much larger
-privilege than this warrants.
-
-```
-docker logs qbittorrent | Select-String "temporary password" | Select-Object -Last 1
-```
-
-Log in at [http://localhost:8090](http://localhost:8090) as `admin`, then **immediately** set your own
-password under *Options → Web UI → Authentication*. Until you do, every restart
-locks you out and you must re-read the log.
-
-Then put those credentials in `.env`:
+Pick whatever password you want in `.env` — the setup script **applies** it to
+qBittorrent, so you do not have to set it in the WebUI yourself:
 
 ```
 QBITTORRENT_USER=admin
 QBITTORRENT_PASSWORD=your-chosen-password
 ```
+
+The one thing that can't be automated is the *first* login. Until a permanent
+password exists, qBittorrent invents a random one on every restart and prints
+it **only to its Docker log** — not to any file the setup script could read.
+Reading it would mean handing the script the Docker socket, a much larger
+privilege than this warrants. So hand it over once, on the host:
+
+```
+docker logs qbittorrent 2>&1 | grep -i "temporary password"     # Linux/macOS
+docker logs qbittorrent | Select-String "temporary password"     # PowerShell
+```
+
+Then run setup with it:
+
+```
+QBITTORRENT_BOOTSTRAP_PASSWORD='<that password>' docker compose run --rm setup
+```
+
+Setup logs in with the temporary password, sets `QBITTORRENT_PASSWORD` from
+`.env` permanently, and carries on with the rest of its work. After that the
+bootstrap value is never needed again — restarts no longer lock you out, and
+Sonarr, Radarr and speed-monitor all authenticate with the `.env` password.
+
+(You can also put `QBITTORRENT_BOOTSTRAP_PASSWORD=` in `.env` instead of
+prefixing the command. Setting the password by hand in *Options → Web UI →
+Authentication* still works too — just make sure it matches `.env`.)
 
 ## 7. Run the automated setup
 
@@ -262,14 +275,17 @@ QBITTORRENT_PASSWORD=your-chosen-password
 docker compose run --rm setup
 ```
 
-This does **everything** in steps 8–13 below — download clients, root folders,
+This does **everything** in steps 8–13 below — the qBittorrent password (see
+step 6), download clients, root folders,
 quality caps, seeder minimums, Prowlarr↔Sonarr/Radarr links, SABnzbd
 categories and whitelist, Bazarr connections, the Jellyfin wizard, libraries,
 hardware transcoding (NVENC by default, or VAAPI with `GPU_VENDOR=amd` — see
 [Using an AMD or Intel GPU instead of
-NVIDIA](#using-an-amd-or-intel-gpu-instead-of-nvidia)), and a startup trigger
+NVIDIA](#using-an-amd-or-intel-gpu-instead-of-nvidia)), a startup trigger
 on Jellyfin's library scan (see
-[§13](#13-jellyfin--the-library)). It uses each app's own REST API (the same
+[§13](#13-jellyfin--the-library)), and Sonarr/Radarr → Jellyfin connections so
+an import triggers an immediate targeted rescan (it also creates the Jellyfin
+API keys those need). It uses each app's own REST API (the same
 calls their web UIs make), so there is no browser automation to break when a
 UI changes.
 
@@ -305,9 +321,18 @@ have access to. Add your torrent trackers and/or Usenet indexers here. This is
 the **only** place indexers get configured — Sonarr and Radarr inherit them.
 
 Some public indexers sit behind Cloudflare bot protection and fail with
-`blocked by CloudFlare Protection`. That is the site deliberately refusing
-automated access. Use an indexer you have proper access to instead — a Usenet
-indexer you subscribe to, or a tracker with a working API.
+`blocked by CloudFlare Protection`. The `setup` script registers **Byparr** (a
+FlareSolverr-compatible headless-browser solver, already running in the stack)
+as a proxy in Prowlarr, along with a `byparr` tag. To route an indexer through
+it, open that indexer in Prowlarr and add the `byparr` tag — Prowlarr only
+proxies indexers that carry the tag.
+
+Byparr clears Cloudflare's JS / "Just a moment…" challenge. It does **not**
+solve interactive CAPTCHAs (Turnstile, hCaptcha) or log in to private trackers,
+and Cloudflare is more aggressive toward the VPN's datacenter IP than a
+residential one — some sites will still refuse. When that happens, use an
+indexer you have proper access to instead — a Usenet indexer you subscribe to,
+or a tracker with a working API.
 
 ## 9. Prowlarr — push indexers to Sonarr and Radarr
 
@@ -437,9 +462,18 @@ Real-time monitoring only sees writes made from inside a container, so a
 host-side copy (e.g. from Windows Explorer) won't show up until the next scan
 or restart.
 
-If you ran the [automated setup](#7-run-the-automated-setup), both of these
-are already done — it adds a startup trigger to the existing scan schedule and
-leaves the interval trigger in place as the backstop.
+The most reliable trigger is Sonarr/Radarr themselves. In each: **Settings →
+Connect → + → Emby / Jellyfin**, host `jellyfin`, port `8096`, an API key from
+Jellyfin's **Dashboard → API Keys**, and **Update Library** on. Now a finished
+import tells Jellyfin to rescan *that one folder* — no waiting for the periodic
+scan, and no scan racing an in-progress multi-file import (which is how episodes
+end up as unplayable "Season Unknown" entries).
+
+If you ran the [automated setup](#7-run-the-automated-setup), all of this is
+already done — the startup trigger, the real-time-monitoring and read-only
+`/media` settings on both libraries, and the Sonarr/Radarr → Jellyfin
+connections (including their API keys). It also *corrects* a library whose
+real-time-monitoring got left off by an older setup run.
 
 If you have an NVIDIA GPU: **Dashboard → Playback → Transcoding** →
 [enable NVENC](#hardware-transcoding). AMD or Intel GPU instead? See
@@ -643,6 +677,12 @@ survives, and for episodes over ~68 minutes even the floor exceeds the cap. In
 practice this means remux releases are excluded almost entirely, which is the
 intended effect: remuxes are minimally compressed and were the direct cause of
 a 262 GB/season release before this cap existed.
+
+**If you use Recyclarr**, it syncs quality definitions from the TRaSH Guides on
+its own schedule, and its numbers will overwrite this cap nightly. So once a
+Recyclarr config carries a `quality_definition` block for an app, `setup` stops
+setting the cap for that app — Recyclarr owns it. Adjust the sizes in your
+`recyclarr-config` (or the guide's template) instead, not `MAX_SIZE_MB_PER_MIN_2160P`.
 
 To change the number: recompute for your episode length —
 `(desired_GB × 1024) / minutes = MB/min`.
@@ -1371,6 +1411,7 @@ narrows the field fast.
 | `joining network namespace ... No such container` | After`--force-recreate` on gluetun, `restart` is not enough. Use `docker compose up -d --force-recreate qbittorrent prowlarr` |
 | Compose says a variable is not set                  | `.env` is missing or lacks `MEDIA_ROOT`. Copy `.env.example`                                                                  |
 | A service can't write to`/data`                   | On Linux,`PUID`/`PGID` don't match the folder owner                                                                             |
+| recyclarr crash-loops, `Access to the path '/config/logs' is denied` | Fresh Linux clone — `./recyclarr-config` is root-owned but recyclarr runs as `1000:1000`. `docker compose run --rm setup` fixes it, or `sudo chown -R 1000:1000 ./recyclarr-config` |
 
 ## Downloads
 
@@ -1403,7 +1444,8 @@ narrows the field fast.
 | --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Shows several servers and none work** | See[below](#jellyfin-shows-several-servers-and-none-work)                                                                                                      |
 | Library is empty                              | Files only appear after Sonarr/Radarr*import* them into `/data/library`. Raw downloads are not in the library                                             |
-| Nothing appears after a download              | **Dashboard → Scheduled Tasks → Scan Media Library**. If that finds it, real-time monitoring missed the event                                         |
+| Nothing appears after a download              | **Dashboard → Scheduled Tasks → Scan Media Library**. If that finds it, real-time monitoring missed the event — check the library has it enabled, and that Sonarr/Radarr have an *Emby / Jellyfin* connection with *Update Library* on |
+| Episode plays "unable to find a valid media" / stuck in "Season Unknown" | The scan caught a multi-file import mid-flight. On the series: **⋯ → Refresh metadata → Replace all metadata**. Prevent it by giving Sonarr/Radarr the Jellyfin connection above so imports trigger a clean rescan |
 | Write/permission errors on scan               | Untick*Save artwork into media folders* and *Save metadata as NFO* — `/media` is read-only by design                                                   |
 | Container won't start                         | Almost always the GPU`deploy:` block on a machine without NVIDIA — delete it, or switch to [`docker-compose.gpu-amd.yml`](#using-an-amd-or-intel-gpu-instead-of-nvidia) if you have an AMD/Intel GPU instead |
 | Can't identify a movie                        | Rename the folder to`Movie Name (Year)`, or use *Identify*                                                                                                |
