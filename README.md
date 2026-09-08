@@ -550,6 +550,73 @@ still works fine.
 feeds straight into Radarr/Sonarr. Worth it only if other people will use the
 server; skip for solo use.
 
+### Bringing in an existing library from another PC
+
+If you already have a media collection on a desktop/NAS and just want to copy it
+onto the server, the simplest route is an **SMB share** — a Windows "network
+drive" backed by the server's library folder. This is a **host-side** setup, not
+part of the container stack, and `setup` does not do it (it needs a package
+install and a user account on the host).
+
+On a Debian/Ubuntu host (or a Proxmox LXC):
+
+```bash
+# 1. Samba, plus smbclient for testing
+sudo apt install samba smbclient
+
+# 2. A user that IS uid/gid 1000 -- the same id every container runs as, so
+#    files arriving through the share are owned exactly as Jellyfin expects.
+#    'nologin' means it can serve files but cannot be used to log in.
+sudo groupadd -g 1000 media 2>/dev/null || true
+sudo useradd  -u 1000 -g 1000 -M -s /usr/sbin/nologin media 2>/dev/null || true
+
+# 3. The share definition
+sudo tee -a /etc/samba/smb.conf >/dev/null <<'EOF'
+
+[library]
+   path = /mnt/media/library
+   read only = no
+   valid users = media
+   force user = media          # everyone who connects is treated as uid 1000,
+   force group = media         # so every file lands owned 1000:1000
+   create mask = 0664
+   directory mask = 0775
+   hosts allow = 192.168.1.    # <-- YOUR LAN's prefix; nothing else can connect
+EOF
+
+# 4. A Samba password for that user (its own password store, not the system one)
+sudo smbpasswd -a media
+sudo smbpasswd -e media
+
+# 5. Start it, and on every boot
+sudo systemctl enable --now smbd
+```
+
+`MEDIA_ROOT` is `/mnt/media` in these commands — adjust if yours differs. Only
+`library/` is exposed on purpose: `torrents/` and `usenet/` next to it hold
+in-progress downloads, and a stray drag-and-drop there would corrupt a running
+transfer.
+
+**On the Windows PC:** File Explorer → *Map network drive* → `\\<server-ip>\library`,
+*Connect using different credentials*, sign in as `media`. Then copy each show
+into `tv\` as `Series Name (Year)\Season 01\…` — filenames just need an `S01E01`
+(or `1x01`) in them. Movies go in `movies\` as `Movie Name (Year)\`.
+
+Jellyfin picks new files up on its own (real-time monitoring, set in
+[§13](#13-jellyfin--the-library)); if something is slow to appear, **Dashboard →
+Scheduled Tasks → Scan Media Library**. There is no need to touch Sonarr/Radarr
+unless you want them to *manage* the imported shows (monitor for new episodes,
+upgrade files) — for that, use their **Library Import** instead of a plain copy.
+
+Two things that bite:
+
+- **`\\<server-ip>` won't connect** → your PC is on a different subnet than the
+  server (same reason a browser can't reach the web UIs — see [Reaching the web
+  UIs from another machine](#reaching-the-web-uis-from-another-machine)). Fix the
+  network, or widen `hosts allow`.
+- **Disk space** — check `df -h /mnt/media` first. The library disk is finite and
+  shared with everything the *arrs download.
+
 ## Everyday commands
 
 ```
