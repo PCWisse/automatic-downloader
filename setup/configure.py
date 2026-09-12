@@ -973,9 +973,28 @@ def configure_jellyfin() -> None:
         accel_type = "vaapi" if GPU_VENDOR == "amd" else "nvenc"
         try:
             enc = requests.get(f"{JELLYFIN_URL}/System/Configuration/encoding", headers=headers, timeout=30).json()
-            if enc.get("HardwareAccelerationType", "").lower() == accel_type:
-                skip(f"Jellyfin: {accel_type} already enabled")
-            else:
+
+            # Jellyfin's decode codec list is a SEPARATE setting from the
+            # encoder backend above, and defaults to just ['h264', 'vc1'] no
+            # matter what HardwareAccelerationType is set to. Missing this
+            # means every HEVC file -- i.e. essentially all 4K, and a lot of
+            # 1080p -- decodes on the CPU while only the encode is hardware.
+            # On a small box that falls behind real time and the stream stalls
+            # repeatedly, while an H.264 source (fully hardware, decode+encode)
+            # plays perfectly -- a confusing split verified live: with 'hevc'
+            # missing, a 4K episode transcoded with no -hwaccel decode flags at
+            # all; adding it made the same file decode+encode entirely on the
+            # GPU at 1.4x realtime. vp8/vp9 have been broadly supported since
+            # ~2015 on both vendors, so they're safe to assume; av1 is not --
+            # only recent GPUs decode it, so it's left for you to enable by
+            # hand (Dashboard -> Playback) once you've confirmed your hardware
+            # supports it.
+            want_codecs = {"h264", "vc1", "hevc", "vp9"}
+            have_codecs = {c.lower() for c in enc.get("HardwareDecodingCodecs", [])}
+
+            drift = []
+            if enc.get("HardwareAccelerationType", "").lower() != accel_type:
+                drift.append("encoder backend")
                 enc["HardwareAccelerationType"] = accel_type
                 enc["EnableHardwareEncoding"] = True
                 if accel_type == "vaapi":
@@ -990,6 +1009,13 @@ def configure_jellyfin() -> None:
                     # HDR looks washed out on SDR screens without this. Safe on
                     # NVENC, where the tone-mapping path needs no extra runtime.
                     enc["EnableTonemapping"] = True
+            if not want_codecs <= have_codecs:
+                drift.append("decode codecs")
+                enc["HardwareDecodingCodecs"] = sorted(have_codecs | want_codecs)
+
+            if not drift:
+                skip(f"Jellyfin: {accel_type} + hardware decode already correct")
+            else:
                 r = requests.post(
                     f"{JELLYFIN_URL}/System/Configuration/encoding",
                     headers=headers,
@@ -997,7 +1023,7 @@ def configure_jellyfin() -> None:
                     timeout=30,
                 )
                 r.raise_for_status()
-                ok(f"Jellyfin: {accel_type} hardware transcoding + tone mapping enabled")
+                ok(f"Jellyfin: {accel_type} hardware transcoding corrected ({', '.join(drift)})")
                 info(f"(harmless if this machine has no {GPU_VENDOR.upper()} GPU -- Jellyfin falls back to CPU)")
         except requests.RequestException as e:
             warn(f"Jellyfin: could not set transcoding options ({e})")

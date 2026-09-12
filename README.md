@@ -1328,6 +1328,19 @@ compose file does the first; you must do the second.
 - Tick **Enable Tone mapping** — HDR/DV content looks washed out on SDR screens
   without it
 
+If you ran [automated setup](#7-run-the-automated-setup), all of this is
+already done — including the codec list, which is easy to miss by hand and
+matters a lot: the encoder and the decoder are configured **separately**, and
+Jellyfin's decoder list defaults to H.264 only. Enabling hardware *encoding*
+without also enabling hardware *decoding* for HEVC means an HEVC file (most
+4K, and plenty of 1080p) decodes on the CPU while only the encode step uses
+the GPU — on a small box that falls behind real time and the stream stalls
+and reloads repeatedly, while an H.264 file (fully hardware end to end) plays
+perfectly. That split — one title fine, another unwatchable — is the signature
+of this specific gap, confirmed live: the same 4K episode went from **no
+hardware decode at all** to **1.4× realtime** the moment HEVC was added to the
+decoding codec list, nothing else changed.
+
 Verify the GPU is actually visible to the container:
 
 ```
@@ -1389,8 +1402,10 @@ only conditional mechanism available, which is why it's a separate file.
 
 `GPU_VENDOR=amd` tells `docker compose run --rm setup` to configure Jellyfin
 for VAAPI instead of NVENC (**Dashboard → Playback → Transcoding** → hardware
-acceleration: **VAAPI**). `GPU_VENDOR=none` leaves hardware transcoding off
-entirely.
+acceleration: **VAAPI**), *and* to enable HEVC/VP9 in the hardware **decoding**
+codec list — see [Hardware transcoding](#hardware-transcoding) for why that
+second part matters as much as the encoder setting. `GPU_VENDOR=none` leaves
+hardware transcoding off entirely.
 
 ⚠ **Tone mapping is deliberately left off on VAAPI.** It needs an OpenCL
 runtime inside the container, and on AMD a missing one makes HDR transcodes
@@ -1530,6 +1545,7 @@ narrows the field fast.
 | Can't identify a movie                        | Rename the folder to`Movie Name (Year)`, or use *Identify*                                                                                                |
 | 4K HDR looks washed out                       | Tick*Enable Tone mapping* under Dashboard → Playback                                                                                                       |
 | Playback stutters on 4K                       | Enable NVENC/VAAPI, or use a client that direct-plays HEVC                                                                                                    |
+| One title stutters/buffers repeatedly, another plays fine | Almost always **decode**, not encode. Dashboard → Playback → Transcoding must have **HEVC** (and VP9) ticked under hardware decoding, not just the encoder — see below. `setup` sets this now; a stack set up before it existed needs one re-run |
 | Forgot the admin password                     | No fallback — recovery means editing the database, or`docker volume rm downloader_jellyfin-config` and redoing the wizard (loses watch history, not media) |
 
 ### Jellyfin shows several servers and none work
