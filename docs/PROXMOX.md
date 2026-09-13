@@ -468,6 +468,10 @@ ports opened and nothing exposed to the public internet**.
 - Tailscale in Docker needs the same TUN device access *plus* container
   capabilities — strictly more moving parts for the same result.
 
+**Shortcut:** inside the LXC, `sudo scripts/setup-tailscale.sh` does everything
+below except the host-side TUN step — and it tells you if that's missing. If
+gluetun already works, the TUN device is already there. The manual route:
+
 First give the LXC access to the TUN device. From the **Proxmox host** shell
 (`<CTID>` = the same real container ID from `pct list` you used in step 5 —
 confirm it again with `pct list` if it's been a while, don't assume you
@@ -496,8 +500,11 @@ the same Tailscale account, anywhere.
 
 Two follow-ups worth doing:
 
-- **Jellyfin:** add `100.64.0.0/10` to **Dashboard → Networking → LAN
-  Networks**, or it treats tailnet clients as remote and rejects them.
+- **Jellyfin:** set **Dashboard → Networking → LAN Networks** to your LAN
+  (e.g. `192.168.1.0/24`), the Compose network (`172.18.0.0/16` — check with
+  `docker network inspect downloader_default`), `100.64.0.0/10` and
+  `fd7a:115c:a1e0::/48`. All four: an explicit list switches off Jellyfin's
+  auto-detection, which inside Docker only ever saw the container network.
 - **MagicDNS** (in the Tailscale admin console) lets you use the machine name
   instead of the IP.
 
