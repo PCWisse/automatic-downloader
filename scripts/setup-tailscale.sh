@@ -79,8 +79,14 @@ ts_state() {
 }
 if [ "$(ts_state)" = "Running" ]; then
   echo "skip: already connected as $(tailscale status --json | python3 -c 'import sys,json; print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))')"
+  # An install from before --accept-dns=false was added: fix it in place.
+  tailscale set --accept-dns=false
 else
-  up_args=(--hostname="$TS_HOSTNAME")
+  # --accept-dns=false: without it Tailscale rewrites /etc/resolv.conf to its
+  # own resolver (100.100.100.100), and every container resolves through it --
+  # so if tailscaled ever stops, Sonarr/Radarr/Jellyseerr lose DNS entirely.
+  # The server is what others connect TO; it never needs tailnet names itself.
+  up_args=(--hostname="$TS_HOSTNAME" --accept-dns=false)
   if [ -n "${TS_AUTHKEY:-}" ]; then
     up_args+=(--authkey="$TS_AUTHKEY")
   else
@@ -163,6 +169,17 @@ The name only resolves with MagicDNS on (Tailscale admin console -> DNS).
 Letting someone else in, restricting what they can reach, and the Chromecast
 caveat: see README -> "Remote access to Jellyfin".
 EOF
+  tailnet="$(tailscale status --json | python3 -c 'import sys,json; print(json.load(sys.stdin).get("CurrentTailnet",{}).get("Name",""))')"
+  peers="$(tailscale status --json | python3 -c 'import sys,json; print(len(json.load(sys.stdin).get("Peer") or {}))')"
+  if [ "$peers" = "0" ]; then
+    cat <<EOF
+
+NOTE: this server is the only device in tailnet "$tailnet" so far. Those
+addresses only open from a device running the Tailscale app, signed in to that
+SAME account -- a different login is a different tailnet, and the page just
+hangs with no error.
+EOF
+  fi
 else
   echo "Tailscale is not connected yet -- re-run this script after signing in."
 fi
