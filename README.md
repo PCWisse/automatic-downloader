@@ -695,6 +695,42 @@ return dozens of entries instead of zero. After the first sync, it repeats
 automatically on `CRON_SCHEDULE` (default: daily at 03:00, set in
 `docker-compose.yml`) — no need to run it by hand again.
 
+### The minimum-score trap
+
+Several guide profiles — Radarr's `[SQP]` ones especially — ship with
+**`min_format_score: 1000`**, and that will silently reject *every* release of
+anything older or less mainstream. Add this to the profile in your
+`recyclarr-config` unless you know you want the strict behaviour:
+
+```yaml
+quality_profiles:
+  - trash_id: e91c9adaca0231493f4af0d571b907f9   # [SQP] SQP-1 WEB (2160p)
+    min_format_score: 0
+```
+
+Why it bites: that score comes almost entirely from TRaSH's release-group
+**Tier** custom formats (+1000…+1700). Resolution and audio bonuses together
+reach about 175, so in practice a release only clears 1000 if its group is on
+one of those lists. Current blockbusters are released by plenty of tiered
+groups, so it works there. A 2011 film that only ungraded groups ever uploaded
+scores ~175 and is refused — not because anything is wrong with it, but because
+the guide has no reputation data for that group. Measured here: four requested
+films returned 14–203 releases each and **zero** approved. Meanwhile a 2005
+XviD BDRip scored 1220, purely because its group is tier-listed — the number
+tracks group reputation, not picture quality.
+
+Setting it to `0` loses nothing that protects you. The negative formats still
+score −10000 and still reject (`LQ`, `Upscaled`, `x265 (no HDR/DV)`,
+`BR-DISK`), the quality size floors still apply, and `upgrade.until_score`
+still makes Radarr replace a low-scoring grab as soon as a tiered release
+appears. It only removes the requirement that a release must *also* prove
+itself via the group list before it may be grabbed at all.
+
+> Change it in the **Recyclarr config**, not in Radarr's UI — the nightly sync
+> puts the guide's value straight back otherwise. And note the config files
+> under `recyclarr-config/configs/` hold your API keys, so they're
+> git-ignored; this is the kind of thing to write down rather than commit.
+
 **Jellyseerr** — a request UI so family/housemates can ask for a film and have
 it feed straight into Radarr/Sonarr, without giving them admin access. Worth it
 only if other people use the server. A ready-to-use (commented-out) service
