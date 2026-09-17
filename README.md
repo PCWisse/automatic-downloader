@@ -149,7 +149,7 @@ you (indexers, Usenet provider, subtitle languages).
 | `docs/PROXMOX.md`                                    | Full runbook for a headless Proxmox box — bare metal → LXC → this stack, with VAAPI transcoding                                                                             |
 | `.gitignore`                                         | Keeps both secret files out of commits                                                                                                                                      |
 | `setup/configure.py`                                 | One-shot API-based configurator —`docker compose run --rm setup`. Idempotent                                                                                             |
-| `recyclarr-config/recyclarr.yml`                     | Quality profile sync config for Sonarr/Radarr.**Contains API keys** — same secret status as `.env`                                                                 |
+| `recyclarr-config/configs/*.yml`                     | Quality profile sync config for Sonarr/Radarr, written by `recyclarr config create`.**Contains API keys** — same secret status as `.env`, and git-ignored          |
 | `speed-monitor/monitor.py`                           | ⚠ Custom-built, not an off-the-shelf project — see[Download quality and speed controls](#download-quality-and-speed-controls)                                              |
 
 ## 1. Create your `.env`
@@ -279,9 +279,12 @@ docker compose run --rm setup
 ```
 
 This does **everything** in steps 8–13 below — the qBittorrent password (see
-step 6), download clients, root folders,
-quality caps, seeder minimums, Prowlarr↔Sonarr/Radarr links, SABnzbd
-categories and whitelist, Bazarr connections, the Jellyfin wizard, libraries,
+step 6), the bind-mount ownership Recyclarr needs, download clients, root
+folders, quality caps (skipped for any app Recyclarr manages, so the two don't
+fight), seeder minimums, Prowlarr↔Sonarr/Radarr links, Byparr as Prowlarr's
+Cloudflare solver, SABnzbd
+categories and whitelist, Bazarr connections, Jellyseerr's Sonarr/Radarr
+connections and request quality, the Jellyfin wizard, libraries,
 hardware transcoding (NVENC by default, or VAAPI with `GPU_VENDOR=amd` — see
 [Using an AMD or Intel GPU instead of
 NVIDIA](#using-an-amd-or-intel-gpu-instead-of-nvidia)), a startup trigger
@@ -655,13 +658,20 @@ controls *resolution*; Recyclarr adds **custom formats** that score releases on
 encode quality, audio, and release-group reputation — filtering out fakes and
 bad encodes automatically. It's a scheduled sync tool, not a live-running
 service — a container that wakes up on a cron schedule, syncs, and goes back to
-sleep. Already included in `docker-compose.yml`, config at
-`recyclarr-config/recyclarr.yml`.
+sleep. Already included in `docker-compose.yml`.
 
 Setup:
 
-1. Put your Sonarr/Radarr API keys and container URLs (`http://sonarr:8989`,
-   `http://radarr:7878`) into `recyclarr-config/recyclarr.yml`
+1. Generate a starter config from a guide template — this writes into
+   `recyclarr-config/configs/` (the `-p` flag is ignored; Recyclarr always
+   uses that directory, and it loads every `.yml` in it):
+
+   ```
+   docker exec recyclarr recyclarr config create -t web-2160p -t sqp-1-web-2160p
+   ```
+
+   Then put your Sonarr/Radarr API keys and container URLs
+   (`http://sonarr:8989`, `http://radarr:7878`) into the files it created
 2. Pick a quality profile from the guide and put its `trash_id` in the config.
    **Get the current, correct ID from Recyclarr itself** — the guide changes,
    and a stale ID from a blog post or an old guide page will fail:
@@ -1385,8 +1395,9 @@ JELLYSEERR_QUALITY_PROFILE=Ultra-HD
 
 It must be a profile name that exists in Sonarr/Radarr (**Settings → Profiles**);
 if it doesn't, the script falls back to the first profile that isn't "Any" and
-says so. "Any" is deliberately never chosen — despite the name it
-[excludes 4K](#quality-profiles-the-any-trap).
+says so. "Any" is deliberately never chosen — despite the name, its
+allowed-qualities list leaves 2160p out, so requests would silently cap at
+1080p.
 
 The one thing left to you is **Settings → Users** to invite people. Requests
 from non-admin users need your approval by default (**Settings → Users →
@@ -1588,7 +1599,7 @@ provider.
 **Port forwarding matters more than raw speed.** Privado has none, on any
 plan — downloads work fine, but no peer can connect *to* you, so seeding is
 weak and poorly-seeded torrents stay slow regardless of your connection speed
-(see [Adding media](#adding-media-you-do-not-add-things-one-at-a-time) — this
+(see [Adding media](#adding-media--you-do-not-add-things-one-at-a-time) — this
 is why per-episode releases often beat season packs). Providers with port
 forwarding (Proton, AirVPN, PIA) fix that directly.
 
