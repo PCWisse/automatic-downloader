@@ -54,7 +54,7 @@ RADARR_URL = "http://radarr:7878"
 BAZARR_URL = "http://bazarr:6767"
 SABNZBD_URL = "http://sabnzbd:8080"
 JELLYFIN_URL = "http://jellyfin:8096"
-JELLYSEERR_URL = "http://jellyseerr:5055"
+JELLYSEERR_URL = "http://seerr:5055"
 
 QBIT_USER = os.environ.get("QBITTORRENT_USER", "")
 QBIT_PASSWORD = os.environ.get("QBITTORRENT_PASSWORD", "")
@@ -79,7 +79,7 @@ SEED_TIME_LIMIT_MIN = int(os.environ.get("QBIT_SEED_TIME_LIMIT_MIN", 180))
 MIN_SEEDERS = int(os.environ.get("INDEXER_MIN_SEEDERS", 5))
 MAX_SIZE_MB_PER_MIN_2160P = int(os.environ.get("MAX_SIZE_MB_PER_MIN_2160P", 252))
 
-# Quality profile Jellyseerr hands to Sonarr/Radarr for new requests. Must be
+# Quality profile Seerr hands to Sonarr/Radarr for new requests. Must be
 # a profile name that exists in them; falls back to the first non-"Any"
 # profile if it doesn't. "Any" is deliberately avoided -- despite the name it
 # EXCLUDES 4K (see README).
@@ -894,7 +894,7 @@ def configure_jellyfin() -> None:
         _manual.append("Jellyfin: check JELLYFIN_ADMIN_USER / JELLYFIN_ADMIN_PASSWORD in .env")
         return
 
-    headers = {"X-Emby-Token": token}
+    headers = {"Authorization": f'MediaBrowser Token="{token}"'}
     try:
         folders = requests.get(f"{JELLYFIN_URL}/Library/VirtualFolders", headers=headers, timeout=30).json()
         have = {f.get("Name"): f for f in folders}
@@ -1078,7 +1078,7 @@ def configure_jellyfin_notifications(sonarr_key: str, radarr_key: str) -> None:
             "host jellyfin, port 8096, 'Update Library' on"
         )
         return
-    jf_headers = {"X-Emby-Token": token}
+    jf_headers = {"Authorization": f'MediaBrowser Token="{token}"'}
 
     # Import/rename events change files on disk; grab/health do not. onGrab is
     # deliberately left off -- it fires before the file exists.
@@ -1159,21 +1159,21 @@ def _ensure_jellyfin_api_key(jf_headers: dict, app: str) -> str | None:
     return next((k.get("AccessToken") for k in keys.get("Items", []) if k.get("AppName") == app), None)
 
 
-# --- Jellyseerr ---------------------------------------------------------------
+# --- Seerr (formerly Jellyseerr) -----------------------------------------------
 
 
 def configure_jellyseerr(sonarr_key: str, radarr_key: str) -> None:
-    """Complete Jellyseerr's setup wizard: sign in with Jellyfin, enable the
+    """Complete Seerr's setup wizard: sign in with Jellyfin, enable the
     libraries, and register Sonarr/Radarr as request targets.
 
-    Unlike every other app here, Jellyseerr authenticates with a SESSION COOKIE
+    Unlike every other app here, Seerr authenticates with a SESSION COOKIE
     rather than an API key -- hence requests.Session() throughout.
     """
-    step("Jellyseerr")
+    step("Seerr")
 
     if not JELLYFIN_USER or not JELLYFIN_PASSWORD:
-        warn("Jellyseerr: needs JELLYFIN_ADMIN_USER/PASSWORD in .env, skipping")
-        _manual.append("Jellyseerr: run its wizard at http://localhost:5055 (signs in with Jellyfin)")
+        warn("Seerr: needs JELLYFIN_ADMIN_USER/PASSWORD in .env, skipping")
+        _manual.append("Seerr: run its wizard at http://localhost:5055 (signs in with Jellyfin)")
         return
 
     s = requests.Session()
@@ -1181,13 +1181,13 @@ def configure_jellyseerr(sonarr_key: str, radarr_key: str) -> None:
     try:
         public = s.get(f"{JELLYSEERR_URL}/api/v1/settings/public", timeout=30).json()
     except requests.RequestException as e:
-        warn(f"Jellyseerr: not reachable ({e})")
+        warn(f"Seerr: not reachable ({e})")
         return
     initialized = bool(public.get("initialized"))
 
     # Sign in. On a FRESH install this also creates the admin account and
     # stores the Jellyfin connection. On a re-run the hostname fields must be
-    # omitted -- Jellyseerr rejects them outright once configured with
+    # omitted -- Seerr rejects them outright once configured with
     # "Jellyfin hostname already configured", which would fail the whole step.
     payload: dict = {"username": JELLYFIN_USER, "password": JELLYFIN_PASSWORD}
     if not initialized:
@@ -1205,11 +1205,11 @@ def configure_jellyseerr(sonarr_key: str, radarr_key: str) -> None:
     try:
         r = s.post(f"{JELLYSEERR_URL}/api/v1/auth/jellyfin", json=payload, timeout=60)
         r.raise_for_status()
-        ok("Jellyseerr: signed in with Jellyfin" if initialized else "Jellyseerr: admin account created")
+        ok("Seerr: signed in with Jellyfin" if initialized else "Seerr: admin account created")
     except requests.RequestException as e:
         detail = getattr(e.response, "text", "")[:200] if getattr(e, "response", None) is not None else e
-        warn(f"Jellyseerr: could not sign in -- {detail}")
-        _manual.append("Jellyseerr: finish its wizard by hand at http://localhost:5055")
+        warn(f"Seerr: could not sign in -- {detail}")
+        _manual.append("Seerr: finish its wizard by hand at http://localhost:5055")
         return
 
     # Libraries. Enabling them is what makes titles show as already-available
@@ -1223,7 +1223,7 @@ def configure_jellyseerr(sonarr_key: str, radarr_key: str) -> None:
     try:
         current = s.get(f"{JELLYSEERR_URL}/api/v1/settings/jellyfin", timeout=30).json().get("libraries", [])
         if current and all(lib.get("enabled") for lib in current):
-            skip(f"Jellyseerr: {len(current)} librar{'y' if len(current) == 1 else 'ies'} already enabled")
+            skip(f"Seerr: {len(current)} librar{'y' if len(current) == 1 else 'ies'} already enabled")
         else:
             found = s.get(
                 f"{JELLYSEERR_URL}/api/v1/settings/jellyfin/library",
@@ -1231,19 +1231,19 @@ def configure_jellyseerr(sonarr_key: str, radarr_key: str) -> None:
                 timeout=60,
             ).json()
             if not found:
-                warn("Jellyseerr: Jellyfin reported no libraries -- create them there first")
+                warn("Seerr: Jellyfin reported no libraries -- create them there first")
             else:
                 libs = s.get(
                     f"{JELLYSEERR_URL}/api/v1/settings/jellyfin/library",
                     params={"enable": ",".join(lib["id"] for lib in found)},
                     timeout=60,
                 ).json()
-                ok(f"Jellyseerr: enabled {len(libs)} librar{'y' if len(libs) == 1 else 'ies'}")
+                ok(f"Seerr: enabled {len(libs)} librar{'y' if len(libs) == 1 else 'ies'}")
     except requests.RequestException as e:
-        warn(f"Jellyseerr: could not sync libraries ({e})")
+        warn(f"Seerr: could not sync libraries ({e})")
 
     # Sonarr / Radarr. The /test endpoint doubles as the only way to read an
-    # app's quality profiles and root folders through Jellyseerr.
+    # app's quality profiles and root folders through Seerr.
     targets = (
         ("radarr", "Radarr", radarr_key, 7878, f"{MEDIA_ROOT_IN_CONTAINER}/library/movies",
          JELLYSEERR_RADARR_PROFILE),
@@ -1252,7 +1252,7 @@ def configure_jellyseerr(sonarr_key: str, radarr_key: str) -> None:
     )
     for slug, label, key, port, want_dir, want_profile in targets:
         if not key:
-            warn(f"Jellyseerr: no {label} API key, skipping")
+            warn(f"Seerr: no {label} API key, skipping")
             continue
         try:
             existing = s.get(f"{JELLYSEERR_URL}/api/v1/settings/{slug}", timeout=30).json()
@@ -1265,7 +1265,7 @@ def configure_jellyseerr(sonarr_key: str, radarr_key: str) -> None:
             profiles = probe.get("profiles", [])
             roots = [r["path"] for r in probe.get("rootFolders", [])]
             if not profiles or not roots:
-                warn(f"Jellyseerr: {label} returned no profiles/root folders")
+                warn(f"Seerr: {label} returned no profiles/root folders")
                 continue
 
             # Prefer the configured name. Falling back silently is how people end
@@ -1276,7 +1276,7 @@ def configure_jellyseerr(sonarr_key: str, radarr_key: str) -> None:
                 chosen = next((p for p in profiles if p["name"] == "HD-1080p"), None)
                 chosen = chosen or next((p for p in profiles if p["name"].lower() != "any"), profiles[0])
                 warn(
-                    f"Jellyseerr: {label} has no quality profile named '{want_profile}' -- "
+                    f"Seerr: {label} has no quality profile named '{want_profile}' -- "
                     f"falling back to '{chosen['name']}'. Set JELLYSEERR_{label.upper()}_PROFILE "
                     "in .env to one of: " + ", ".join(p["name"] for p in profiles)
                 )
@@ -1285,10 +1285,10 @@ def configure_jellyseerr(sonarr_key: str, radarr_key: str) -> None:
             if existing:
                 # Already connected. Only correct the quality profile if it has
                 # drifted from what .env asks for -- anything else the user may
-                # have tuned in Jellyseerr's UI is left exactly as it is.
+                # have tuned in Seerr's UI is left exactly as it is.
                 svc = next((e for e in existing if e.get("isDefault")), existing[0])
                 if svc.get("activeProfileId") == chosen["id"]:
-                    skip(f"Jellyseerr: {label} already connected -> {svc.get('activeProfileName')}")
+                    skip(f"Seerr: {label} already connected -> {svc.get('activeProfileName')}")
                     continue
                 # 'id' is read-only on this endpoint and 400s if sent back.
                 body = {k: v for k, v in svc.items() if k != "id"}
@@ -1297,7 +1297,7 @@ def configure_jellyseerr(sonarr_key: str, radarr_key: str) -> None:
                 s.put(
                     f"{JELLYSEERR_URL}/api/v1/settings/{slug}/{svc['id']}", json=body, timeout=60
                 ).raise_for_status()
-                ok(f"Jellyseerr: {label} quality profile {svc.get('activeProfileName')!r} -> {chosen['name']!r}")
+                ok(f"Seerr: {label} quality profile {svc.get('activeProfileName')!r} -> {chosen['name']!r}")
                 continue
 
             body = {
@@ -1319,19 +1319,19 @@ def configure_jellyseerr(sonarr_key: str, radarr_key: str) -> None:
                 body["enableSeasonFolders"] = True
 
             s.post(f"{JELLYSEERR_URL}/api/v1/settings/{slug}", json=body, timeout=60).raise_for_status()
-            ok(f"Jellyseerr: {label} connected -> {chosen['name']}, {root}")
+            ok(f"Seerr: {label} connected -> {chosen['name']}, {root}")
         except requests.RequestException as e:
             detail = getattr(e.response, "text", "")[:200] if getattr(e, "response", None) is not None else e
-            warn(f"Jellyseerr: could not connect {label} -- {detail}")
+            warn(f"Seerr: could not connect {label} -- {detail}")
 
     if initialized:
-        skip("Jellyseerr: setup already finalized")
+        skip("Seerr: setup already finalized")
     else:
         try:
             s.post(f"{JELLYSEERR_URL}/api/v1/settings/initialize", json={}, timeout=30).raise_for_status()
-            ok("Jellyseerr: setup complete -- http://localhost:5055")
+            ok("Seerr: setup complete -- http://localhost:5055")
         except requests.RequestException as e:
-            warn(f"Jellyseerr: could not finalize setup ({e})")
+            warn(f"Seerr: could not finalize setup ({e})")
 
 
 # --- main --------------------------------------------------------------------
@@ -1356,7 +1356,7 @@ def main() -> int:
     wait_for("Bazarr", f"{BAZARR_URL}/")
     wait_for("SABnzbd", f"{SABNZBD_URL}/")
     wait_for("Jellyfin", f"{JELLYFIN_URL}/System/Info/Public")
-    wait_for("Jellyseerr", f"{JELLYSEERR_URL}/api/v1/status")
+    wait_for("Seerr", f"{JELLYSEERR_URL}/api/v1/status")
 
     step("Reading API keys from config volumes")
     sonarr_key = read_arr_api_key("/keys/sonarr/config.xml", "Sonarr")

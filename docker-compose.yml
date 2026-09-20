@@ -185,11 +185,13 @@ services:
   # Radarr/Sonarr logins. Approved requests are handed straight to them.
   # Not VPN-routed -- it only talks to Jellyfin/Sonarr/Radarr and TMDB, never
   # to a torrent swarm or an indexer. Same reasoning as Sonarr/Radarr.
-  # Its wizard is the one part of the stack the setup script does not automate
-  # -- see README's "Jellyseerr -- requests".
-  jellyseerr:
-    image: fallenbagel/jellyseerr:latest
-    container_name: jellyseerr
+  # Seerr is the successor to Jellyseerr (v3+), with native Jellyfin 12
+  # support.  The volume keeps the old name so existing data migrates
+  # automatically on first start.
+  seerr:
+    image: ghcr.io/seerr-team/seerr:latest
+    container_name: seerr
+    init: true
     ports:
       - ${BIND_ADDRESS:-127.0.0.1}:5055:5055
     environment:

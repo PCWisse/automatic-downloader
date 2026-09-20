@@ -164,11 +164,12 @@ services:
               capabilities: [gpu]
     restart: unless-stopped
 
-  # Identical to docker-compose.yml's jellyseerr -- it was never VPN-routed
-  # there either, so nothing changes. See that file for the full comment.
-  jellyseerr:
-    image: fallenbagel/jellyseerr:latest
-    container_name: jellyseerr
+  # Identical to docker-compose.yml's seerr -- see that file for the full
+  # comment.  Seerr (v3+) replaces Jellyseerr with native JF 12 support.
+  seerr:
+    image: ghcr.io/seerr-team/seerr:latest
+    container_name: seerr
+    init: true
     ports:
       - ${BIND_ADDRESS:-127.0.0.1}:5055:5055
     environment:
