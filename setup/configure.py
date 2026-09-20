@@ -894,7 +894,24 @@ def configure_jellyfin() -> None:
         _manual.append("Jellyfin: check JELLYFIN_ADMIN_USER / JELLYFIN_ADMIN_PASSWORD in .env")
         return
 
-    headers = {"X-Emby-Token": token}
+    headers = {"Authorization": f'MediaBrowser Token="{token}"'}
+
+    # Jellyfin 12 dropped X-Emby-Token; Jellyseerr (and other tools) still use
+    # it.  EnableLegacyAuthorization brings it back.
+    try:
+        sys_cfg = requests.get(f"{JELLYFIN_URL}/System/Configuration", headers=headers, timeout=30).json()
+        if not sys_cfg.get("EnableLegacyAuthorization"):
+            sys_cfg["EnableLegacyAuthorization"] = True
+            requests.post(
+                f"{JELLYFIN_URL}/System/Configuration", headers=headers,
+                json=sys_cfg, timeout=30,
+            ).raise_for_status()
+            ok("Jellyfin: enabled legacy authorization (needed by Jellyseerr)")
+        else:
+            skip("Jellyfin: legacy authorization already enabled")
+    except requests.RequestException as e:
+        warn(f"Jellyfin: could not check/set legacy authorization ({e})")
+
     try:
         folders = requests.get(f"{JELLYFIN_URL}/Library/VirtualFolders", headers=headers, timeout=30).json()
         have = {f.get("Name"): f for f in folders}
@@ -1078,7 +1095,7 @@ def configure_jellyfin_notifications(sonarr_key: str, radarr_key: str) -> None:
             "host jellyfin, port 8096, 'Update Library' on"
         )
         return
-    jf_headers = {"X-Emby-Token": token}
+    jf_headers = {"Authorization": f'MediaBrowser Token="{token}"'}
 
     # Import/rename events change files on disk; grab/health do not. onGrab is
     # deliberately left off -- it fires before the file exists.
