@@ -182,11 +182,21 @@ downloading anything.
 
 ## 6. Set a permanent qBittorrent password
 
-This is the **only** step the automation can't do for you. qBittorrent prints
-its random first-run password only to its Docker log, never to a file.
+Pick whatever password you want in `.env` — the next step **applies** it to
+qBittorrent for you, so you don't have to set it in the WebUI yourself:
+
+```ini
+QBITTORRENT_USER=admin
+QBITTORRENT_PASSWORD=your-chosen-password
+```
+
+The one thing that can't be automated is the *first* login. Until a permanent
+password exists, qBittorrent invents a random one on every restart and prints
+it **only** to its Docker log, which the setup container can't read (it has no
+Docker socket, on purpose). So hand it over once:
 
 ```bash
-docker logs qbittorrent 2>&1 | grep "temporary password"
+docker logs qbittorrent 2>&1 | grep -i "temporary password"
 ```
 
 <details>
@@ -197,18 +207,15 @@ docker logs qbittorrent | Select-String "temporary password" | Select-Object -La
 ```
 </details>
 
-1. Open <http://localhost:8090>
-2. Log in as `admin` with that temporary password
-3. Go to **Options → Web UI → Authentication** and set your own password
-4. Put it in `.env`:
+Then run the next step **with that password**, once:
 
-```ini
-QBITTORRENT_USER=admin
-QBITTORRENT_PASSWORD=your-chosen-password
+```bash
+QBITTORRENT_BOOTSTRAP_PASSWORD='<that password>' docker compose run --rm setup
 ```
 
-⚠ Do this now, not later. Until you set a permanent password, **every container
-restart generates a new random one** and locks you out.
+Setup logs in with the temporary password, sets your `.env` one permanently,
+and carries on. After that, restarts no longer lock you out and you never need
+the bootstrap value again.
 
 **Optional but recommended** — also add a Jellyfin account to `.env`, and the
 next step will set up Jellyfin **and Jellyseerr** completely for you (Jellyseerr
@@ -227,11 +234,14 @@ JELLYFIN_ADMIN_PASSWORD=your-password
 docker compose run --rm setup
 ```
 
-This configures **everything else**: download clients, folders, quality rules,
-size caps, seeder minimums, app-to-app connections, SABnzbd categories, Bazarr,
-Jellyfin's wizard + libraries + hardware transcoding + a startup trigger on
-the library scan (so new media shows up right after a restart, not just on the
-next scheduled scan), and Jellyseerr's whole setup — admin account, libraries,
+This configures **everything else**: the qBittorrent password (above), download
+clients, folders, quality rules, size caps, seeder minimums, app-to-app
+connections, Byparr as Prowlarr's Cloudflare solver, SABnzbd categories,
+Bazarr, Jellyfin's wizard + libraries + hardware transcoding (encoder *and*
+decoder — see [Hardware transcoding](../README.md#hardware-transcoding), the
+decoder half is easy to miss and causes 4K to stutter) + a startup trigger on
+the library scan, Sonarr/Radarr → Jellyfin connections so an import triggers
+an immediate rescan, and Jellyseerr's whole setup — admin account, libraries,
 and its Sonarr/Radarr connections.
 
 You'll see a list of `[ok]` and `[skip]` lines, then a summary. **Safe to re-run
@@ -349,7 +359,26 @@ if the app finds multiple entries.
 **Add media in bulk** — instead of one at a time, point Radarr/Sonarr at a
 Trakt or IMDb list under **Settings → Import Lists**. Add a film to that list
 from your phone and it downloads automatically. See
-[Adding media](../README.md#adding-media-you-do-not-add-things-one-at-a-time).
+[Adding media](../README.md#adding-media--you-do-not-add-things-one-at-a-time).
+
+### Optional host scripts
+
+None of these are required, and none of them touch the stack if you skip them.
+Run them on the machine Docker runs on (on Proxmox: inside the LXC).
+
+| Script | What for |
+| --- | --- |
+| `sudo scripts/setup-tailscale.sh` | Reach Jellyfin/Jellyseerr from outside the house, with no router ports opened. See [Remote access](../README.md#remote-access-to-jellyfin) |
+| `sudo scripts/setup-smb.sh` | A Windows network drive onto the library folder, to copy an existing collection over. See [Bringing in an existing library](../README.md#bringing-in-an-existing-library-from-another-pc) |
+| `scripts/prefer-english.sh <folder>` | Make English the default audio track on releases that ship a foreign dub as default. See [Audio and subtitle language](../README.md#audio-and-subtitle-language) |
+
+### If requests never start downloading
+
+Radarr can find dozens of releases and approve none of them. The usual cause
+is a guide quality profile shipping `min_format_score: 1000`, which in practice
+demands a release group from TRaSH's curated lists — fine for new blockbusters,
+an unconditional refusal for older films. See
+[The minimum-score trap](../README.md#the-minimum-score-trap).
 
 ---
 

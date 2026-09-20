@@ -142,13 +142,14 @@ you (indexers, Usenet provider, subtitle languages).
 | `scripts\vpn-toggle.ps1` / `scripts/vpn-toggle.sh` | Pause/resume the tunnel. Windows/Linux, identical behavior                                                                                                                  |
 | `scripts\speedtest.ps1` / `scripts/speedtest.sh`   | Direct vs tunnelled throughput. Windows/Linux, identical behavior                                                                                                           |
 | `scripts/setup-smb.sh`                              | **Host** script — expose the library folder as a Windows SMB share for copying media in from a PC. See [Bringing in an existing library](#bringing-in-an-existing-library-from-another-pc) |
+| `scripts/setup-tailscale.sh`                        | **Host** script, optional — join a Tailscale tailnet and set Jellyfin's LAN Networks, for remote access with nothing exposed publicly. See [Remote access to Jellyfin](#remote-access-to-jellyfin) |
 | `scripts/prefer-english.sh`                         | **Host** script — flip Matroska track flags so English is the default audio on ITA/MULTi releases. See [Audio and subtitle language](#audio-and-subtitle-language)          |
 | `docker-compose.novpn.yml`                           | ⚠ Full stack, no VPN — an alternative to`docker-compose.yml`, not an addition. See [ONE-TIME-SETUP.md](docs/ONE-TIME-SETUP.md#optional-running-the-whole-stack-without-a-vpn) |
 | `docker-compose.gpu-amd.yml`                         | Override, layered with `-f` on top of either compose file above — VAAPI for AMD/Intel GPUs instead of NVIDIA/NVENC. See [Using an AMD or Intel GPU instead of NVIDIA](#using-an-amd-or-intel-gpu-instead-of-nvidia) |
 | `docs/PROXMOX.md`                                    | Full runbook for a headless Proxmox box — bare metal → LXC → this stack, with VAAPI transcoding                                                                             |
 | `.gitignore`                                         | Keeps both secret files out of commits                                                                                                                                      |
 | `setup/configure.py`                                 | One-shot API-based configurator —`docker compose run --rm setup`. Idempotent                                                                                             |
-| `recyclarr-config/recyclarr.yml`                     | Quality profile sync config for Sonarr/Radarr.**Contains API keys** — same secret status as `.env`                                                                 |
+| `recyclarr-config/configs/*.yml`                     | Quality profile sync config for Sonarr/Radarr, written by `recyclarr config create`.**Contains API keys** — same secret status as `.env`, and git-ignored          |
 | `speed-monitor/monitor.py`                           | ⚠ Custom-built, not an off-the-shelf project — see[Download quality and speed controls](#download-quality-and-speed-controls)                                              |
 
 ## 1. Create your `.env`
@@ -278,9 +279,12 @@ docker compose run --rm setup
 ```
 
 This does **everything** in steps 8–13 below — the qBittorrent password (see
-step 6), download clients, root folders,
-quality caps, seeder minimums, Prowlarr↔Sonarr/Radarr links, SABnzbd
-categories and whitelist, Bazarr connections, the Jellyfin wizard, libraries,
+step 6), the bind-mount ownership Recyclarr needs, download clients, root
+folders, quality caps (skipped for any app Recyclarr manages, so the two don't
+fight), seeder minimums, Prowlarr↔Sonarr/Radarr links, Byparr as Prowlarr's
+Cloudflare solver, SABnzbd
+categories and whitelist, Bazarr connections, Jellyseerr's Sonarr/Radarr
+connections and request quality, the Jellyfin wizard, libraries,
 hardware transcoding (NVENC by default, or VAAPI with `GPU_VENDOR=amd` — see
 [Using an AMD or Intel GPU instead of
 NVIDIA](#using-an-amd-or-intel-gpu-instead-of-nvidia)), a startup trigger
@@ -654,13 +658,20 @@ controls *resolution*; Recyclarr adds **custom formats** that score releases on
 encode quality, audio, and release-group reputation — filtering out fakes and
 bad encodes automatically. It's a scheduled sync tool, not a live-running
 service — a container that wakes up on a cron schedule, syncs, and goes back to
-sleep. Already included in `docker-compose.yml`, config at
-`recyclarr-config/recyclarr.yml`.
+sleep. Already included in `docker-compose.yml`.
 
 Setup:
 
-1. Put your Sonarr/Radarr API keys and container URLs (`http://sonarr:8989`,
-   `http://radarr:7878`) into `recyclarr-config/recyclarr.yml`
+1. Generate a starter config from a guide template — this writes into
+   `recyclarr-config/configs/` (the `-p` flag is ignored; Recyclarr always
+   uses that directory, and it loads every `.yml` in it):
+
+   ```
+   docker exec recyclarr recyclarr config create -t web-2160p -t sqp-1-web-2160p
+   ```
+
+   Then put your Sonarr/Radarr API keys and container URLs
+   (`http://sonarr:8989`, `http://radarr:7878`) into the files it created
 2. Pick a quality profile from the guide and put its `trash_id` in the config.
    **Get the current, correct ID from Recyclarr itself** — the guide changes,
    and a stale ID from a blog post or an old guide page will fail:
@@ -693,6 +704,42 @@ Your new profile should appear in that list, and `/api/v3/customformat` should
 return dozens of entries instead of zero. After the first sync, it repeats
 automatically on `CRON_SCHEDULE` (default: daily at 03:00, set in
 `docker-compose.yml`) — no need to run it by hand again.
+
+### The minimum-score trap
+
+Several guide profiles — Radarr's `[SQP]` ones especially — ship with
+**`min_format_score: 1000`**, and that will silently reject *every* release of
+anything older or less mainstream. Add this to the profile in your
+`recyclarr-config` unless you know you want the strict behaviour:
+
+```yaml
+quality_profiles:
+  - trash_id: e91c9adaca0231493f4af0d571b907f9   # [SQP] SQP-1 WEB (2160p)
+    min_format_score: 0
+```
+
+Why it bites: that score comes almost entirely from TRaSH's release-group
+**Tier** custom formats (+1000…+1700). Resolution and audio bonuses together
+reach about 175, so in practice a release only clears 1000 if its group is on
+one of those lists. Current blockbusters are released by plenty of tiered
+groups, so it works there. A 2011 film that only ungraded groups ever uploaded
+scores ~175 and is refused — not because anything is wrong with it, but because
+the guide has no reputation data for that group. Measured here: four requested
+films returned 14–203 releases each and **zero** approved. Meanwhile a 2005
+XviD BDRip scored 1220, purely because its group is tier-listed — the number
+tracks group reputation, not picture quality.
+
+Setting it to `0` loses nothing that protects you. The negative formats still
+score −10000 and still reject (`LQ`, `Upscaled`, `x265 (no HDR/DV)`,
+`BR-DISK`), the quality size floors still apply, and `upgrade.until_score`
+still makes Radarr replace a low-scoring grab as soon as a tiered release
+appears. It only removes the requirement that a release must *also* prove
+itself via the group list before it may be grabbed at all.
+
+> Change it in the **Recyclarr config**, not in Radarr's UI — the nightly sync
+> puts the guide's value straight back otherwise. And note the config files
+> under `recyclarr-config/configs/` hold your API keys, so they're
+> git-ignored; this is the kind of thing to write down rather than commit.
 
 **Jellyseerr** — a request UI so family/housemates can ask for a film and have
 it feed straight into Radarr/Sonarr, without giving them admin access. Worth it
@@ -1190,12 +1237,27 @@ The checkbox **is** required for Tailscale, though — tailnet clients get
 ### Tailscale — the recommended way
 
 An encrypted private mesh between your own devices. **No router ports opened,
-nothing exposed to the public internet.**
+nothing exposed to the public internet.** Entirely optional — nothing else in
+the stack depends on it.
+
+On a Linux host or Proxmox LXC there's a script for the server side:
+
+```bash
+sudo scripts/setup-tailscale.sh
+#   TS_AUTHKEY=tskey-auth-...   log in without a browser
+#   TS_HOSTNAME=mediaserver     tailnet name (default: this machine's hostname)
+```
+
+It checks the TUN device, installs Tailscale from its official package repo,
+runs `tailscale up` (prints a login URL and waits), sets Jellyfin's LAN
+Networks (below), and prints the addresses to use. Safe to re-run.
+
+By hand, or on Windows:
 
 1. Create a free account at [https://tailscale.com](https://tailscale.com)
-2. Install the client on this PC and sign in
+2. Install the client on the server and sign in
 3. Install it on every device you want to watch from — same account
-4. Find this machine's address: `tailscale ip -4` (a `100.x.y.z`)
+4. Find the server's address: `tailscale ip -4` (a `100.x.y.z`)
 5. Browse to `http://100.x.y.z:8096`
 
 This covers the **whole stack**, not just Jellyfin — Jellyseerr at
@@ -1210,10 +1272,63 @@ once `BIND_ADDRESS` lets them off loopback.
 > service a tailnet address with no compose changes at all. On Proxmox, "the
 > host" means inside the LXC — see [docs/PROXMOX.md](docs/PROXMOX.md#11-optional-tailscale-for-access-from-outside-the-house).
 
-For Jellyfin to accept those clients, add `100.64.0.0/10` to
-**Dashboard → Networking → LAN Networks**.
+For Jellyfin to treat those clients as local, set **Dashboard → Networking →
+LAN Networks**. Add *all* of these, not just the tailnet range:
+
+```
+192.168.1.0/24          # your home LAN -- yours may differ
+172.18.0.0/16           # the Compose network: docker network inspect downloader_default
+100.64.0.0/10           # Tailscale IPv4
+fd7a:115c:a1e0::/48     # Tailscale IPv6
+```
+
+Why all four: an *empty* list means "auto-detect", and inside Docker Jellyfin
+can only detect the container network — it never sees your real LAN. The
+moment you type an explicit list, auto-detection stops, so anything left off
+(the LAN, the other containers) stops counting as local. The script does this
+merge for you.
 
 With **MagicDNS** on you can use the machine name instead of the IP.
+
+### Letting someone else in (partner, family)
+
+1. **Invite them to your tailnet** — admin console → **Users → Invite**. They
+   install the Tailscale app and sign in with the invited account.
+2. **Give them a Jellyfin account** — Jellyfin → **Dashboard → Users → +**.
+   Don't share yours: watch history and resume points are per user.
+3. **Let them into Jellyseerr** — Jellyseerr → **Users → Import Jellyfin Users**,
+   then they sign in with that Jellyfin account.
+4. **Optionally, limit what they can reach.** The default tailnet policy allows
+   everything, so an invited user can also open Sonarr, qBittorrent and the
+   rest (those still ask for their own logins). To allow only Jellyfin and
+   Jellyseerr, edit **Access controls** in the admin console along these lines:
+
+   ```json
+   {
+     "hosts": { "mediaserver": "100.x.y.z" },
+     "acls": [
+       { "action": "accept", "src": ["you@example.com"],     "dst": ["*:*"] },
+       { "action": "accept", "src": ["partner@example.com"], "dst": ["mediaserver:8096,5055"] }
+     ]
+   }
+   ```
+
+   Replacing the policy removes the default allow-everything rule, so keep a
+   rule for yourself or you lock yourself out of your own devices.
+
+Things that don't change with Tailscale:
+
+- **Casting to a Chromecast away from home doesn't work.** The Chromecast
+  fetches the stream itself and can't join a tailnet. At home it's on the LAN,
+  so it's fine. An Android TV away from home can run the Tailscale app.
+- **Remote streaming is capped by your home *upload* speed**, not download. A
+  4K stream is 15–25 Mbps; if upload is the limit, pick a lower quality in the
+  player or let Jellyfin transcode down.
+- qBittorrent and Prowlarr sit inside the VPN container. If their web UIs don't
+  load over the tailnet, add `100.64.0.0/10` to `FIREWALL_OUTBOUND_SUBNETS` in
+  `docker-compose.yml` — gluetun's firewall can block traffic to addresses
+  outside that list. Not needed for Jellyfin or Jellyseerr, which aren't in
+  the VPN container.
 
 ### Free HTTPS with a real certificate
 
@@ -1280,8 +1395,9 @@ JELLYSEERR_QUALITY_PROFILE=Ultra-HD
 
 It must be a profile name that exists in Sonarr/Radarr (**Settings → Profiles**);
 if it doesn't, the script falls back to the first profile that isn't "Any" and
-says so. "Any" is deliberately never chosen — despite the name it
-[excludes 4K](#quality-profiles-the-any-trap).
+says so. "Any" is deliberately never chosen — despite the name, its
+allowed-qualities list leaves 2160p out, so requests would silently cap at
+1080p.
 
 The one thing left to you is **Settings → Users** to invite people. Requests
 from non-admin users need your approval by default (**Settings → Users →
@@ -1483,7 +1599,7 @@ provider.
 **Port forwarding matters more than raw speed.** Privado has none, on any
 plan — downloads work fine, but no peer can connect *to* you, so seeding is
 weak and poorly-seeded torrents stay slow regardless of your connection speed
-(see [Adding media](#adding-media-you-do-not-add-things-one-at-a-time) — this
+(see [Adding media](#adding-media--you-do-not-add-things-one-at-a-time) — this
 is why per-episode releases often beat season packs). Providers with port
 forwarding (Proton, AirVPN, PIA) fix that directly.
 

@@ -9,8 +9,16 @@ recyclarr-config/configs/
 # Runtime data -- regenerated automatically, no reason to commit.
 # resources/ is Recyclarr's own 73 MB clone of the TRaSH-Guides repo;
 # logs/ is debug output Recyclarr never reads back.
+#
+# state/ was tracked until V1.5 and that actively broke things: git stores no
+# file ownership, so every merge/checkout rewrote these as whoever ran git
+# (root), while recyclarr runs as 1000:1000 -- it then died with "Access to
+# the path '/config/state/...' is denied" on six consecutive nightly syncs
+# before anyone noticed. They're machine-specific anyway: the directory name
+# is a hash of this instance's URL + API key.
 recyclarr-config/logs/
 recyclarr-config/resources/
+recyclarr-config/state/
 speed-monitor/state/
 
 # Windows / editor noise
