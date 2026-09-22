@@ -747,6 +747,50 @@ only if other people use the server. A ready-to-use (commented-out) service
 block already exists at the bottom of `docker-compose.yml` — uncomment it and
 `docker compose up -d` to add it.
 
+### Retro gaming — JellyEmu
+
+[JellyEmu](https://github.com/Jellyfin-PG/JellyEmu) turns Jellyfin into a
+browsable, playable ROM library — box art from IGDB/RAWG, games launch
+in-browser via EmulatorJS (30+ systems: NES, SNES, PS1, N64, Game Boy, Sega
+Genesis, MAME, DOS, PICO-8, …). It's a Jellyfin **plugin**, installed through
+the Dashboard's plugin catalogue, not a container in `docker-compose.yml`.
+
+> **Compatibility note:** JellyEmu injects JavaScript into the whole Jellyfin
+> web client (via its "File Transformation" dependency), and Jellyfin 12
+> changed the frontend's internal player API enough that early JellyEmu
+> releases (≤0.9.1.0) crashed *every* item detail page, not just games —
+> [Jellyfin-PG/JellyEmu#205](https://github.com/Jellyfin-PG/JellyEmu/issues/205).
+> Fixed from **0.9.2.0** onward. If you install this on a Jellyfin 12+ server,
+> use 0.9.2.0 or later — check the plugin catalogue's version, don't assume
+> "latest" is safe on a whim.
+
+Like Tailscale, this is a **host script**, not part of `docker compose run
+--rm setup` — installing a plugin on every fresh clone of this repo would be
+overreach, and it needs to restart the Jellyfin container, which the
+container-based setup step never does:
+
+```bash
+sudo scripts/setup-jellyemu.sh
+```
+
+It adds the Jellyfin-PG plugin repository, installs "File Transformation"
+(JellyEmu's UI-injection dependency) and JellyEmu itself, restarts Jellyfin
+only if a plugin isn't loaded yet, creates `$MEDIA_ROOT/library/games` (owned
+1000:1000, same as `movies/`/`tv/` — already inside Jellyfin's existing
+`/media` bind mount, so it shows up with no compose change), and creates the
+library (content type **Books** — that's the scanner JellyEmu hooks into)
+pointed at `/media/games`. Safe to re-run.
+
+Left for you, same reasoning as the [Jellyseerr admin email](#7-run-the-automated-setup) —
+these are your own accounts, the script has no business creating them:
+
+- **API keys** — Dashboard → Plugins → JellyEmu needs free IGDB and RAWG
+  accounts for box art/metadata: [IGDB API docs](https://api-docs.igdb.com/) ·
+  [RAWG API docs](https://rawg.io/apidocs).
+- **ROMs** — copy them into `games\<system>\` over the
+  [SMB share](#bringing-in-an-existing-library-from-another-pc), then **Scan
+  Library** on the new Books library.
+
 ## Download quality and speed controls
 
 Three separate mechanisms, each catching a different failure mode. They run

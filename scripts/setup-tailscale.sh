@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# OPTIONAL: reach Jellyfin and Jellyseerr from outside the house over Tailscale
+# OPTIONAL: reach Jellyfin and Seerr from outside the house over Tailscale
 # -- an encrypted private network between your own devices. No router ports are
 # opened and nothing is published to the internet; only devices signed into
 # your tailnet can connect.
@@ -84,7 +84,7 @@ if [ "$(ts_state)" = "Running" ]; then
 else
   # --accept-dns=false: without it Tailscale rewrites /etc/resolv.conf to its
   # own resolver (100.100.100.100), and every container resolves through it --
-  # so if tailscaled ever stops, Sonarr/Radarr/Jellyseerr lose DNS entirely.
+  # so if tailscaled ever stops, Sonarr/Radarr/Seerr lose DNS entirely.
   # The server is what others connect TO; it never needs tailnet names itself.
   up_args=(--hostname="$TS_HOSTNAME" --accept-dns=false)
   if [ -n "${TS_AUTHKEY:-}" ]; then
@@ -120,9 +120,7 @@ base = os.environ["JELLYFIN_URL"].rstrip("/")
 auth = 'MediaBrowser Client="setup-tailscale", Device="setup", DeviceId="setup-tailscale", Version="1.0"'
 
 def call(path, data=None, token=None):
-    headers = {"Authorization": auth, "Content-Type": "application/json"}
-    if token:
-        headers["X-Emby-Token"] = token
+    headers = {"Authorization": f'MediaBrowser Token="{token}"' if token else auth, "Content-Type": "application/json"}
     body = json.dumps(data).encode() if data is not None else None
     req = urllib.request.Request(base + path, data=body, headers=headers,
                                  method="POST" if body is not None else "GET")
@@ -163,7 +161,7 @@ if [ "$(ts_state)" = "Running" ]; then
 From any device signed into your tailnet:
 
   Jellyfin    http://$dns:8096    (or http://$ip4:8096)
-  Jellyseerr  http://$dns:5055    (or http://$ip4:5055)
+  Seerr       http://$dns:5055    (or http://$ip4:5055)
 
 The name only resolves with MagicDNS on (Tailscale admin console -> DNS).
 Letting someone else in, restricting what they can reach, and the Chromecast
