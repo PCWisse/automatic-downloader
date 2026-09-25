@@ -1387,6 +1387,32 @@ tailscale serve --bg 8096
 > Do **not** use `tailscale funnel` unless you mean it — that publishes the
 > service to the entire internet, which is exactly what this avoids.
 
+### Cloudflare Tunnel — access with no app on the viewer's device (planned, not set up yet)
+
+Tailscale requires everyone you share with to install the Tailscale app and
+join your tailnet. **Cloudflare Tunnel** is the closer match to "like Plex" —
+the viewer just opens a normal `https://` URL in a browser, nothing to
+install. Trade-off: unlike Tailscale, the login page is reachable from the
+public internet (mitigate with **Cloudflare Access** in front of it — an
+email-code check before Jellyfin's own login is even reached, still no app on
+the viewer's side). It also fixes the one thing Tailscale can't:
+**Chromecasting from outside the house** — a Chromecast can't join a tailnet,
+but it can fetch a normal public URL.
+
+Not implemented yet — needs a domain name on Cloudflare's nameservers first
+(free, but the DNS cutover takes a few hours to 24h). Status:
+
+- [ ] Domain added to Cloudflare (Cloudflare dashboard → *Add a domain* →
+      switch nameservers at the registrar)
+- [ ] `cloudflared` installed on the host, tunnel created, DNS route added
+- [ ] Ingress config: public hostname → `http://localhost:8096` (Jellyfin),
+      optionally `:5055` for Jellyseerr too
+- [ ] Optionally, Cloudflare Access in front of it (Zero Trust → Access →
+      Applications) so the login page itself isn't wide open
+
+Once the domain shows **Active** in the Cloudflare dashboard, the rest is a
+~15 minute job — pick this back up then.
+
 ## Reaching the web UIs from another machine
 
 By default every admin UI binds to `127.0.0.1` — reachable only from the
