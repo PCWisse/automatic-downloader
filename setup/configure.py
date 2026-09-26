@@ -1145,6 +1145,67 @@ def configure_jellyfin_notifications(sonarr_key: str, radarr_key: str) -> None:
             warn(f"{label}: could not set Jellyfin connection ({e})")
 
 
+def configure_auto_unmonitor(sonarr_key: str, radarr_key: str) -> None:
+    """Register the Custom Script connections that stop Sonarr/Radarr from
+    monitoring (and endlessly re-searching/upgrading) something once it's
+    actually finished downloading.
+
+    Sonarr has no season-vs-series ambiguity here: the check lives entirely
+    inside scripts/arr-hooks/*.sh, keyed off each *arr's own per-season
+    `nextAiring` field, so a season that's aired-and-downloaded is unmonitored
+    while a season still airing (an ongoing show like South Park) is left
+    alone. This function only wires up the Connect entry -- see the scripts
+    themselves for the actual logic.
+    """
+    step("Auto-unmonitor once downloaded")
+
+    targets = [
+        ("Sonarr", SONARR_URL, sonarr_key, "/arr-hooks/sonarr-unmonitor.sh"),
+        ("Radarr", RADARR_URL, radarr_key, "/arr-hooks/radarr-unmonitor.sh"),
+    ]
+    wanted_events = {"onDownload", "onUpgrade"}
+
+    for label, base, key, script_path in targets:
+        if not key:
+            continue
+        try:
+            existing = arr_get(base, "/api/v3/notification", key)
+            current = next(
+                (n for n in existing if n.get("implementation") == "CustomScript"
+                 and get_field(n, "path") == script_path),
+                None,
+            )
+            if current and all(current.get(e) for e in wanted_events):
+                skip(f"{label}: auto-unmonitor hook already set")
+                continue
+
+            schema = arr_get(base, "/api/v3/notification/schema", key)
+            template = next((s for s in schema if s.get("implementation") == "CustomScript"), None)
+            if template is None:
+                warn(f"{label}: no 'CustomScript' notification schema, skipping")
+                continue
+
+            payload = dict(current) if current else dict(template)
+            payload["name"] = "Auto-unmonitor"
+            payload["implementation"] = "CustomScript"
+            payload["configContract"] = "CustomScriptSettings"
+            for k in list(payload):
+                if k.startswith("on") and f"supportsOn{k[2:]}" in template:
+                    payload[k] = k in wanted_events
+            set_field(payload, "path", script_path)
+
+            if current:
+                arr_put(base, f"/api/v3/notification/{current['id']}", key, payload)
+                ok(f"{label}: auto-unmonitor hook corrected")
+            else:
+                arr_post(base, "/api/v3/notification", key, payload)
+                ok(f"{label}: auto-unmonitor hook added")
+        except requests.HTTPError as e:
+            warn(f"{label}: could not set auto-unmonitor hook -- {e.response.text[:200]}")
+        except requests.RequestException as e:
+            warn(f"{label}: could not set auto-unmonitor hook ({e})")
+
+
 def _ensure_jellyfin_api_key(jf_headers: dict, app: str) -> str | None:
     """Return an existing Jellyfin API key for `app`, creating one if needed."""
     keys = requests.get(f"{JELLYFIN_URL}/Auth/Keys", headers=jf_headers, timeout=30).json()
@@ -1392,6 +1453,7 @@ def main() -> int:
     configure_bazarr(bazarr_key, sonarr_key or "", radarr_key or "")
     configure_jellyfin()
     configure_jellyfin_notifications(sonarr_key or "", radarr_key or "")
+    configure_auto_unmonitor(sonarr_key or "", radarr_key or "")
     configure_jellyseerr(sonarr_key or "", radarr_key or "")
 
     print("\n" + "=" * 70)

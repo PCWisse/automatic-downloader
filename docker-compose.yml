@@ -107,6 +107,10 @@ services:
     volumes:
       - sonarr-config:/config
       - ${MEDIA_ROOT}:/data
+      # Custom Script connection target -- auto-unmonitors a season once it's
+      # fully downloaded and nothing more is airing for it. Read-only: the
+      # script only ever calls out to Sonarr's own API, never touches disk.
+      - ./scripts/arr-hooks:/arr-hooks:ro
     restart: unless-stopped
 
   radarr:
@@ -121,6 +125,7 @@ services:
     volumes:
       - radarr-config:/config
       - ${MEDIA_ROOT}:/data
+      - ./scripts/arr-hooks:/arr-hooks:ro
     restart: unless-stopped
 
   bazarr:
