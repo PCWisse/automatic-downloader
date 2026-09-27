@@ -1501,6 +1501,34 @@ state from `/settings/jellyfin` instead and only ever hits the library endpoint
 with `sync` and `enable` together. Worth knowing if you script against it
 yourself.
 
+## Auto-unmonitor once downloaded
+
+Once something is fully in, there's no reason for Sonarr/Radarr to keep
+searching it for upgrades forever — but you don't want to lose monitoring on
+a show that's still airing, or a season with an episode yet to come. This is
+handled automatically, configured for you by `docker compose run --rm setup`:
+a Sonarr/Radarr **Custom Script** connection (Settings → Connect) fires on
+every import/upgrade and runs `scripts/arr-hooks/{sonarr,radarr}-unmonitor.sh`
+— inside the *arr's own container, not a separate service.
+
+- **Radarr**: once a movie has a file, it's unmonitored. A movie has no "more
+  coming" state, so this is unconditional.
+- **Sonarr**: per **season**, not per series. A season is unmonitored only
+  once every already-aired episode in it has a file *and* the *arr's own
+  `nextAiring` field for that season is empty — i.e. nothing scheduled. An
+  ongoing show's current season (an episode still due) is left alone even
+  while its older, finished seasons get unmonitored right alongside it.
+
+Nothing here is destructive — it only flips a monitoring flag, never touches
+a file. Re-monitor anything by hand at any time (Sonarr/Radarr → the
+show/movie → toggle Monitored) if you want it searched again.
+
+> If Bazarr is set to only look for subtitles on monitored content, it stops
+> searching the moment something is unmonitored here too — usually fine
+> (you already have the subtitles for something long since downloaded), but
+> worth knowing if a completed season looks like it stopped getting new
+> subtitle providers checked.
+
 ## Hardware transcoding
 
 Passing the GPU into the container and *using* it are two different things. The

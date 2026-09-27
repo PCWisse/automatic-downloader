@@ -91,6 +91,7 @@ services:
     volumes:
       - sonarr-config:/config
       - ${MEDIA_ROOT}:/data
+      - ./scripts/arr-hooks:/arr-hooks:ro
     restart: unless-stopped
 
   radarr:
@@ -105,6 +106,7 @@ services:
     volumes:
       - radarr-config:/config
       - ${MEDIA_ROOT}:/data
+      - ./scripts/arr-hooks:/arr-hooks:ro
     restart: unless-stopped
 
   bazarr:
